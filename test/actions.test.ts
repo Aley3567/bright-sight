@@ -86,3 +86,15 @@ test("actions: 默认缓存目录在用户 home 下，不落到仓库里", () =>
   assert.match(d, /\/\.bright-sight$/);
   assert.ok(!d.startsWith(process.cwd()), "缓存是机器本地状态，不能污染工作区");
 });
+
+test("actions: 缓存目录与 surface.json 的权限是 0700 / 0600，不听凭 umask", async () => {
+  // surface.json 是「这台机器装了哪些可脚本化应用」的清单，属于指纹类信息。
+  // 落在 mkdtemp 建出来的目录里测不到 mkdir 的 mode——mkdtemp 自己就给 0700，
+  // 所以特意用一层还不存在的子目录，逼 loadSurface 自己去创建它。
+  await withCacheDir(async (base) => {
+    const dir = `${base}/未创建过`;
+    await loadSurface({ dirs: SMALL_DIRS, cacheDir: dir });
+    assert.equal((await stat(dir)).mode & 0o777, 0o700);
+    assert.equal((await stat(`${dir}/surface.json`)).mode & 0o777, 0o600, "rename 会保留临时文件的权限位");
+  });
+});

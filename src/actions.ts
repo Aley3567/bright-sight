@@ -315,12 +315,15 @@ export async function loadSurface(
 
   const surface = await buildFrom(paths);
   try {
-    await mkdir(cacheDir, { recursive: true });
+    // 0o700 / 0o600 显式写出来，不听凭 umask：surface.json 是一份「这台机器装了
+    // 哪些可脚本化应用」的清单，属于指纹类信息。journal.ts 与 settings.ts 都已显式给权限，
+    // 这里漏掉就成了三个落盘点里唯一听凭 umask 的那个。
+    await mkdir(cacheDir, { recursive: true, mode: 0o700 });
     // 先写临时文件再 rename：两个 run 并发时，读者要么看到旧的完整文件，
     // 要么看到新的完整文件，不会读到写到一半的 JSON
     const tmp = `${file}.tmp-${process.pid}`;
     const payload: CacheFile = { fingerprint: fp, ...surface };
-    await writeFile(tmp, JSON.stringify(payload), "utf8");
+    await writeFile(tmp, JSON.stringify(payload), { encoding: "utf8", mode: 0o600 });
     await rename(tmp, file);
   } catch {
     // 写缓存失败（只读 home、磁盘满）不影响本次结果
