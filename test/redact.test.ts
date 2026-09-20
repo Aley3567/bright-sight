@@ -63,6 +63,38 @@ test("redact: observe 的 window 为 null 时原样保留，不编一个假指�
   assert.equal(out.window, null);
 });
 
+test("redact: observe 的 AX 完整度字段按结构放行，只有 window 被指纹化", () => {
+  // 这三个字段是数字 / 枚举 / null，不含用户内容，正是「这次观察是不是残缺的」唯一线索。
+  // 它们必须逐条确认不敏感并显式放行，不能靠 default 分支（那是全量指纹化＝过度脱敏）。
+  const r = makeRedactor("hash", SALT);
+  const out = r.event("observe", {
+    front: "Google Chrome",
+    window: "GitHub",
+    axTruncated: "depth",
+    axNodes: 120,
+    axNextOffset: 80,
+  }) as Record<string, unknown>;
+
+  assert.equal(out.front, "Google Chrome", "应用名是结构");
+  assert.equal(fp(out.window).len, 6, "窗口标题是内容，仍然指纹化");
+  assert.equal(out.axTruncated, "depth");
+  assert.equal(out.axNodes, 120);
+  assert.equal(out.axNextOffset, 80);
+});
+
+test("redact: observe 里白名单之外的字段一律指纹化——以后加字段不会静默泄露", () => {
+  // 阳性对照：把一条来路不明的字符串塞进 observe，它必须落成指纹而不是原样。
+  // 没有这条，「白名单之外按内容处理」这句就只能靠读代码相信。
+  const r = makeRedactor("hash", SALT);
+  const out = r.event("observe", {
+    front: "Finder",
+    window: null,
+    来路不明: "用户界面上的文字",
+  }) as Record<string, unknown>;
+  assert.notEqual(out["来路不明"], "用户界面上的文字");
+  assert.equal(fp(out["来路不明"]).len, 8);
+});
+
 test("redact: judge 保留概率与判据，只抹掉从原话切出来的片段", () => {
   const r = makeRedactor("hash", SALT);
   const out = r.event("judge", {

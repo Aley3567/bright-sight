@@ -125,6 +125,59 @@ final class AXRuntimeTests: XCTestCase {
     XCTAssertEqual(store.applicationCalls, 4, "被拒的那条不能悄悄变成第三次调用")
   }
 
+  /// 真机上「预算由请求参数派生」这件事只有这一条测试压得住：`budget` 曾是进程级常量，
+  /// 与请求参数完全无关——把它当基准、由请求覆盖之后，传了 depth 的那次必须真的走到更深的一层。
+  func testObserveBudgetComesFromTheRequestNotTheProcessConstant() {
+    let store = deepStore(pid: 701)
+    let runtime = AXRuntime(
+      client: FakeAXClient(store: store),
+      budget: AXTraversalBudget(maxDepth: 1, maxNodes: 100, maxMilliseconds: 5_000, pageSize: 50)
+    )
+
+    // 不带 depth：退回基准预算（depth 1），在 depth 处截断
+    let shallow = expectation(description: "浅观察")
+    runtime.observe(params: .object(["scope": .string("application"), "pid": .number(701)])) { result in
+      defer { shallow.fulfill() }
+      guard case let .success(json) = result else { return XCTFail("观察不该失败：\(result)") }
+      XCTAssertEqual(json["truncated"]?["reason"]?.stringValue, AXTruncation.Reason.depth.rawValue)
+    }
+    wait(for: [shallow], timeout: 2)
+
+    // 传 depth 3：这一轮走到树底，不再截断——证明请求参数真的进了遍历，而不是被进程常量盖住
+    let deeper = expectation(description: "深观察")
+    runtime.observe(params: .object([
+      "scope": .string("application"),
+      "pid": .number(701),
+      "depth": .number(3),
+    ])) { result in
+      defer { deeper.fulfill() }
+      guard case let .success(json) = result else { return XCTFail("观察不该失败：\(result)") }
+      XCTAssertNil(json["truncated"], "给了 depth 3 就该走完整棵树")
+      XCTAssertEqual(json["page"]?["total"]?.intValue, 1, "树底的按钮应当进得了动作面")
+    }
+    wait(for: [deeper], timeout: 2)
+  }
+
+  /// app → group → group → button 的四层树：depth 1 时按钮够不着，depth 3 时够得着。
+  private func deepStore(pid: pid_t) -> FakeAXStore {
+    let app = AXUIElementCreateApplication(pid)
+    let window = AXUIElementCreateApplication(pid + 1)
+    let level1 = AXUIElementCreateApplication(pid + 2)
+    let level2 = AXUIElementCreateApplication(pid + 3)
+    let button = AXUIElementCreateApplication(pid + 4)
+    let store = FakeAXStore(application: app, focusedWindow: window)
+    store.add(window, state: axState(role: kAXWindowRole as String, title: "Main"))
+    store.add(button, state: axState(
+      role: kAXButtonRole as String,
+      title: "Go",
+      actions: [kAXPressAction as String]
+    ))
+    store.add(level2, state: axState(role: kAXGroupRole as String), children: [button])
+    store.add(level1, state: axState(role: kAXGroupRole as String), children: [level2])
+    store.add(app, state: axState(role: kAXApplicationRole as String), children: [level1])
+    return store
+  }
+
   private func buttonStore(pid: pid_t) -> FakeAXStore {
     let app = AXUIElementCreateApplication(pid)
     let window = AXUIElementCreateApplication(pid + 1)

@@ -503,6 +503,56 @@ test("decide: 没有 AX offer 时 head 结构与改造前一致——不走两�
   assert.ok(!actionKeys.some((k) => k.startsWith("AX:")), "没有 AX offer 就不该冒出 AX 代表项");
 });
 
+// ── 动作面残缺时把「还有没展示的目标」告诉模型（remaining-work §2.1） ──────────
+//
+// cli.ts 此前把 truncated / nextOffset 丢了，模型不知道自己手里的目标列表是残缺的，会在一个
+// 残缺的集合里硬选。下面三条分别压住：残缺时信号出现、完整时信号不冒出来（不越界）、
+// 以及「遍历没走完」与「还有下一页」两个独立信号各自都能触发提示。
+
+test("decide: 动作面被截断时，state 与 AX 代表项都告诉模型「还有没展示的目标」", async () => {
+  const calls: Call[] = [];
+  const base = axInput([...AX_CLICKS, ...AX_OPEN]);
+  await judge(
+    fakeClient({ action: choiceAnswer(TAB, majority(TAB)), span: choiceAnswer(SPAN1) }, calls),
+    { ...base, truncated: { reason: "depth", depth: 6, nodes: 120, ms: 20 }, nextOffset: 80 },
+  );
+
+  const state = calls[0].state as Record<string, unknown>;
+  const note = state["界面可操作目标"];
+  assert.equal(typeof note, "string", "残缺时必须给出这句状态——模型看不见的东西对它等于不存在");
+  assert.match(note as string, /还有没展示出来的目标/);
+  assert.match(note as string, /depth/, "截断原因要写清楚，它决定模型该不该换个办法");
+
+  const criteria = criteriaOf(calls[0].questions.action);
+  assert.match(String(criteria["AX:CLICK"]), /可能还有未展示的目标/, "代表项的题干也要带上这句");
+});
+
+test("decide: 动作面完整时不冒出任何提示——新判据不越界", async () => {
+  const calls: Call[] = [];
+  const base = axInput([...AX_CLICKS, ...AX_OPEN]);
+  await judge(fakeClient({ action: choiceAnswer(TAB, majority(TAB)), span: choiceAnswer(SPAN1) }, calls), base);
+
+  const state = calls[0].state as Record<string, unknown>;
+  assert.equal("界面可操作目标" in state, false, "完整时不该加这个 key——无关状态只摊薄注意力");
+  const criteria = criteriaOf(calls[0].questions.action);
+  assert.equal(String(criteria["AX:CLICK"]), "AX CLICK：界面上的 2 个可操作目标", "完整时代表项说明逐字不变");
+});
+
+test("decide: 未截断但还有下一页时同样提示——两个信号互相独立", async () => {
+  const calls: Call[] = [];
+  const base = axInput([...AX_CLICKS, ...AX_OPEN]);
+  await judge(
+    fakeClient({ action: choiceAnswer(TAB, majority(TAB)), span: choiceAnswer(SPAN1) }, calls),
+    { ...base, nextOffset: 80 },
+  );
+
+  const state = calls[0].state as Record<string, unknown>;
+  assert.match(String(state["界面可操作目标"]), /还有没展示出来的目标/);
+  assert.match(String(state["界面可操作目标"]), /下一页/, "这一路是分页不是截断，原因要如实说");
+  const criteria = criteriaOf(calls[0].questions.action);
+  assert.match(String(criteria["AX:CLICK"]), /可能还有未展示的目标/);
+});
+
 
 // ── 模型版本钉死 ──────────────────────────────────────────────────────────────
 //

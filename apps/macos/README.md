@@ -8,7 +8,8 @@
 
 核心是一个**长驻**的 `bright-sight serve`，两侧走 stdio 上的 JSON Lines 双向 RPC。人读契约在
 `src/protocol.ts`；Swift 这侧是它的影子 `Sources/BrightSightVoice/CoreBridge/`，会漂移，对齐靠
-平行测试而不是 codegen。`ax.observe` / `ax.perform` 仍回 `method_not_found`，反向通道骨架就绪、AX 未接线。
+平行测试而不是 codegen。`ax.observe` / `ax.perform` 已经接线：递给模型的选项里既有从 sdef 解析出
+的脚本动作，也有从无障碍树观察出来的界面动作，后者的执行落在 Swift 这侧。
 连续几条指令复用同一个 Node 进程；核心崩了下一条指令会把它拉起来，但**不会替你重发上一条**——
 那条指令的副作用发生没有，这一侧看不见，只能由人决定。
 

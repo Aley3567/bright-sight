@@ -85,6 +85,22 @@ function brief(v: string, n = 80): string {
 }
 
 /**
+ * `observe` 事件里关于 AX 动作面完整度的那几个字段。
+ *
+ * 全是数字 / 枚举 / null，**不含任何用户内容**——所以在 `redact.ts` 的 observe 分支里按结构
+ * 原样放行（窗口标题那种来路不明的字符串仍然走指纹化）。没有 AX 的那一轮（降级为仅脚本动作）
+ * 一个字段都不加，事件形状与引入 AX 之前逐字段相等。
+ */
+function axObservationFields(ax: AxExecContext | undefined): Record<string, unknown> {
+  if (!ax) return {};
+  return {
+    axTruncated: ax.truncated?.reason ?? null,
+    axNodes: ax.truncated?.nodes ?? null,
+    axNextOffset: ax.nextOffset ?? null,
+  };
+}
+
+/**
  * 构造"正文可以取自哪里"的候选。
  *
  * 产物值来自页面回读，是不可信数据。把它放进 state 给模型看是安全的：
@@ -306,7 +322,12 @@ async function resumeSteps(
 
   // 重新观察，而不是拿挂起时那份快照。人可能盯着气泡看了五分钟
   const snapshot = await deps.observe();
-  await deps.record?.("observe", pending.step, { front: snapshot.front, window: snapshot.window });
+  // 留痕要能看出这次观察是不是被截断的：AX 完整度那几个字段随事件一起落盘（都是结构，见 redact.ts）
+  await deps.record?.("observe", pending.step, {
+    front: snapshot.front,
+    window: snapshot.window,
+    ...axObservationFields(opts.ax),
+  });
   const drift = staleness({
     mark: cp.freshness,
     now: freshnessMark(snapshot, opts.profile),
@@ -377,7 +398,11 @@ async function drive(
 
   for (let step = from; step <= limits.maxSteps; step++) {
     const snapshot = await deps.observe();
-    await deps.record?.("observe", step, { front: snapshot.front, window: snapshot.window });
+    await deps.record?.("observe", step, {
+      front: snapshot.front,
+      window: snapshot.window,
+      ...axObservationFields(opts.ax),
+    });
 
     const spans = extractSpans(state.utterance);
     // 先用最可能的片段构造正文候选；模型改选了别的片段，下一轮自然会跟着变
@@ -390,6 +415,10 @@ async function drive(
       spans,
       bodySources,
       history: state.steps.map(summarize),
+      // 动作面的完整度随 frame 一起来（`opts.ax`）。它不属于 Snapshot——那是"屏幕上现在是什么"，
+      // 而这是"我们这一轮看到了多少"。少了它，模型无从知道目标列表是不是残缺的。
+      truncated: opts.ax?.truncated,
+      nextOffset: opts.ax?.nextOffset,
     });
     await deps.record?.("judge", step, decision);
 

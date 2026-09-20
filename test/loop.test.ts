@@ -5,7 +5,7 @@ import { runAction } from "../src/capability.ts";
 import { SEARCH_ENGINES } from "../src/config.ts";
 import { SPAN_SOURCE } from "../src/execute.ts";
 import type { AxActionOffer, AxActionStatus, AxPeer } from "../src/ax.ts";
-import type { Decision } from "../src/decide.ts";
+import type { Decision, JudgeInput } from "../src/decide.ts";
 import type { AxFrameView, OfferSet } from "../src/surface.ts";
 import type { ExecOutcome } from "../src/execute.ts";
 import type { AxActionSpec, Judgement, ProfileGate, ScriptActionSpec, Snapshot, VerifyResult } from "../src/types.ts";
@@ -637,7 +637,16 @@ function performs(seen: Seen): Seen {
 }
 
 function axOpt(frame: AxFrameView, peer: AxPeer): LoopOptions {
-  return { ax: { peer, frameId: frame.frameId, offers: frame.offers, app: frame.app } };
+  return {
+    ax: {
+      peer,
+      frameId: frame.frameId,
+      offers: frame.offers,
+      app: frame.app,
+      truncated: frame.truncated,
+      nextOffset: frame.nextOffset,
+    },
+  };
 }
 
 /** act 走真的 runAction，于是 AX 动作真的经过适配器与 performAX。 */
@@ -919,4 +928,61 @@ test("复核: 挂起留痕不原样落下 AX 的 offerId——它和 judge 里�
   const suspend = events.find((e) => e.phase === "suspend")!.data as Record<string, unknown>;
   assert.equal(suspend.actionId, undefined, "AX 的 offerId 不该占用「本系统常量」那个字段名");
   assert.equal(suspend.targetId, "click-1", "它该走 targetId——redact 对这个字段名一律指纹化");
+});
+
+// ── 截断与翻页信息透传（remaining-work §2.1） ────────────────────────────────
+//
+// `cli.ts` 此前把 observe 返回的 truncated / nextOffset 全丢了。下面两条压住「透传到了」与
+// 「没有 AX 时不冒新字段」两面：只测有截断的顺风路径，会让「忘了给某个分支接上」全绿通过。
+
+test("A2: 被截断的 frame 把完整度同时送进 decide 与 observe 留痕", async () => {
+  const events: { phase: string; data: unknown }[] = [];
+  const click = axOffer("click-1", "CLICK", "确定");
+  const truncated: AxFrameView = {
+    frameId: "frame-1",
+    pid: 42,
+    app: AX_APP,
+    offers: [click],
+    truncated: { reason: "depth", depth: 6, nodes: 120, ms: 20 },
+    nextOffset: 80,
+  };
+  let seen: JudgeInput | null = null;
+  const d = axDeps([decision("DONE")]);
+  d.decide = (input) => {
+    seen = input;
+    return Promise.resolve(decision("DONE"));
+  };
+  d.record = (phase, _step, data) => {
+    events.push({ phase, data });
+    return Promise.resolve();
+  };
+
+  await runLoop("点确定", axOfferSet("frame-1", [click]), d, axOpt(truncated, axPeer([])));
+
+  assert.equal(seen!.truncated?.reason, "depth", "截断信息必须到决策层——模型靠它知道列表是残缺的");
+  assert.equal(seen!.nextOffset, 80, "nextOffset 不能被丢掉，类型留出了位置就要一路带过去");
+
+  const observe = events.find((e) => e.phase === "observe")!.data as Record<string, unknown>;
+  assert.equal(observe.axTruncated, "depth", "留痕要能看出这次观察被截断了");
+  assert.equal(observe.axNodes, 120);
+  assert.equal(observe.axNextOffset, 80);
+});
+
+test("A2: 没有 AX 的那一轮，observe 留痕形状与引入 AX 之前逐字段相等", async () => {
+  const events: { phase: string; data: unknown }[] = [];
+  const d = deps({
+    script: [decision(TAB)],
+    record: (phase, _step, data) => {
+      events.push({ phase, data });
+      return Promise.resolve();
+    },
+  });
+  await run("搜一下 X", d);
+
+  const observe = events.find((e) => e.phase === "observe")!.data as Record<string, unknown>;
+  assert.deepEqual(
+    Object.keys(observe).sort(),
+    ["front", "window"],
+    "降级为仅脚本动作时不该多出任何字段——新判据不能越界到没有 AX 的那条路径",
+  );
 });

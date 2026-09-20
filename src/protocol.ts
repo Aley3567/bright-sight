@@ -326,10 +326,17 @@ export type SessionDescribeParams = Record<string, never>;
  * 位置留在这里的意义是：反向通道的机制（rpc.ts 的 `call`）这一轮已经能用且有测试，
  * 阶段 4 只需要在 Swift 侧注册这两个方法名，不必再动协议骨架。
  *
- *   ax.observe  `{scope: "focusedWindow" | "application", pid?: number, offset?: number, pageSize?: number}`
- *               → `{frameId, offers: ActionOffer[], truncated?: {reason, depth, nodes, ms}}`
+ *   ax.observe  `{scope: "focusedWindow" | "application", pid?: number, offset?: number, pageSize?: number,
+ *                 depth?: number, nodes?: number, ms?: number}`
+ *               → `{frameId, pid, offers: ActionOffer[], page: {offset, count, total, nextOffset?},
+ *                   elapsedMs, truncated?: {reason: "depth" | "nodes" | "deadline", depth, nodes, ms}}`
  *   ax.perform  `{frameId, offerId, operation, value?}`
  *               → `{status: "executed" | "rejected_stale" | "failed" | "effect_unknown", …}`
+ *
+ * `depth` / `nodes` / `ms` 是这一轮遍历的**资源预算**覆盖项（三个整数，不是 selector / 坐标），
+ * 一律可选：省略 = 用对端 `protectiveDefault` 的对应值，**不放大**（`depth` 省略不会变成「不限」）。
+ * 上限由两侧各自按 `AXWireLimits` / `AX_MAX_*` 校验，越界当场拒。按上面的兼容规则 3，
+ * 收到不认识的字段忽略、不报错；加字段一律可选、已有字段不改名不改语义。`PROTOCOL_VERSION` 不动。
  *
  * 形状沿用 `docs/agent-v2-design.md` §3.2，两条硬约束一并记在这里：
  *   - `frameId` / `offerId` 都由 **Swift** 在观察那一刻铸造，Node 只能原样回传。

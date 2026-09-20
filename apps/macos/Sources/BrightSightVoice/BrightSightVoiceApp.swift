@@ -42,6 +42,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       }
     }
     _ = commandMonitor.start(promptForPermission: false)
+    // 首次运行几乎一定还没授权，这里就开始等：用户去系统设置打开开关、切回 App，
+    // 右 Command 当场可用。菜单标题每次右键都会重建，所以它会自己变成「已允许」。
+    commandMonitor.startWatchingForTrust()
 
     panelController.show()
   }
@@ -132,6 +135,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
   @objc private func requestAccessibilityPermission() {
     _ = commandMonitor.requestPermission()
+    // 弹窗只是把用户送到系统设置。真正要等的是他打开开关那一下，所以这里也要开始轮询
+    // ——不重复调用的话，用户从「从来没授权过」这条路走进来就永远不会被重装。
+    commandMonitor.startWatchingForTrust()
   }
 
   @objc private func quitApp() {

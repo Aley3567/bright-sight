@@ -1,5 +1,5 @@
-import { choice, noul, TypeSafeClient } from "@typesafe-ai/sdk";
-import type { AxOperation } from "./ax.ts";
+import { choice, noul, TypeSafeClient, type JsonValue } from "@typesafe-ai/sdk";
+import type { AxOperation, AxTruncation } from "./ax.ts";
 import type { Offer } from "./surface.ts";
 import type { ActionSpec, Judgement, Snapshot } from "./types.ts";
 import { isVerbatim } from "./spans.ts";
@@ -264,6 +264,15 @@ export type JudgeInput = {
   bodySources: readonly BodySource[];
   /** 已完成步骤的摘要，让模型知道自己走到哪了。 */
   history: readonly string[];
+  /**
+   * 这一轮的 AX 动作面是否被截断、以及还有没有下一页。
+   *
+   * 两者是独立的信号：`truncated` 是遍历没走完（可能还有目标没被发现），`nextOffset` 是
+   * 这一页装不下（还有目标没被列出来）。任一存在都意味着模型手里的目标列表是**残缺的**——
+   * 不说的话它会在一个残缺的集合里硬选一个最像的，然后点错。
+   */
+  truncated?: AxTruncation;
+  nextOffset?: number;
 };
 
 export type Decision = {
@@ -374,13 +383,13 @@ function checkDistribution(
   }
 }
 
-function richState(input: JudgeInput) {
+function richState(input: JudgeInput): Record<string, JsonValue> {
   const s = input.snapshot;
   // 产物必须进决策上下文，不能只进 body head 的选项：实测第二步模型会重复提议
   // 开标签页，因为它压根不知道链接已经拿到手了。选 action 的那一问看不见的东西，
   // 对这一问就等于不存在
   const gathered = input.bodySources.filter((b) => b.key !== "span").map((b) => b.hint);
-  return {
+  const state: Record<string, JsonValue> = {
     用户说: input.utterance,
     已经做完的步骤: input.history.length > 0 ? [...input.history] : ["还没有开始"],
     已经拿到的东西: gathered.length > 0 ? gathered : ["还没有拿到任何东西"],
@@ -390,6 +399,25 @@ function richState(input: JudgeInput) {
     选中的文字: s.selection ?? "无",
     可用的原话片段: [...input.spans],
   };
+  // 动作面残缺时把这件事说出来。模型看不见的东西对它等于不存在，而「目标没列全」正是它
+  // 会硬选一个最像的、然后点错的地方——不给这个信号，它既不会去等也不会去问。
+  // 完整时**不加**这个 key：多一句无关状态只摊薄注意力（官方 jaggedness 文档点名的失败模式）。
+  // 条件写入而不是展开一个可能带 undefined 的对象：SDK 的 state 是 `Record<string, JsonValue>`，
+  // 一个值为 undefined 的键过不了类型（也会在 JSON 序列化时被整个丢掉，落成「没说过」的样子）。
+  if (axSurfaceIncomplete(input)) {
+    state["界面可操作目标"] = `只列出了其中一部分（${axIncompleteReason(input)}），界面上可能还有没展示出来的目标`;
+  }
+  return state;
+}
+
+/** AX 动作面这一轮是否不完整：遍历被截断，或还有下一页没取。任一成立模型手里的目标就可能是残缺的。 */
+function axSurfaceIncomplete(input: JudgeInput): boolean {
+  return input.truncated !== undefined || input.nextOffset !== undefined;
+}
+
+function axIncompleteReason(input: JudgeInput): string {
+  if (input.truncated) return `遍历在 ${input.truncated.reason} 处停下`;
+  return "还有下一页没取";
 }
 
 export async function judge(
@@ -416,8 +444,13 @@ export async function judge(
     if (group) group.push(o);
     else opTargets.set(o.operation, [o]);
   }
+  // 动作面被截断或还有下一页时，代表项的说明里如实加一句。这句是模型那道单选题的题干，
+  // 它在这里能看见「列表不完整」——state 里另有一份（`richState`）。两处都放，是因为模型
+  // 可能只看其中一个：题干在选项上，state 在题干之外。
+  const incomplete = axSurfaceIncomplete(input);
   for (const [op, group] of opTargets) {
-    actionOpts[axHeadId(op)] = `AX ${op}：界面上的 ${group.length} 个可操作目标`;
+    actionOpts[axHeadId(op)] =
+      `AX ${op}：界面上的 ${group.length} 个可操作目标${incomplete ? "（可能还有未展示的目标）" : ""}`;
   }
 
   // 动态 head：候选只有一个时代码直接填，少问一个问题就少一条失败路径

@@ -65,7 +65,14 @@ final class AXRuntime: @unchecked Sendable {
         _ = compatibility.prepare(processID: processID, application: app) {
           try client.setManualAccessibility(on: $0)
         }
-        let result = try AXSurfaceBuilder(client: client, budget: budget).observe(parsed, processID: processID)
+        // `budget` 是进程级的**基准**，不是最终值：把请求带来的 depth / nodes / ms 覆盖上去，
+        // 不给的项退回基准值（缺省保守）。把它当常量直接遍历，请求参数就完全失效了。
+        let effective = budget.overridden(
+          maxDepth: parsed.depth,
+          maxNodes: parsed.nodes,
+          maxMilliseconds: parsed.milliseconds
+        )
+        let result = try AXSurfaceBuilder(client: client, budget: effective).observe(parsed, processID: processID)
         frames.insert(result.frame)
         return .success(result.json)
       } catch {

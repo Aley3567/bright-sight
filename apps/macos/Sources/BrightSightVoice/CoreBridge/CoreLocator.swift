@@ -5,6 +5,11 @@ struct CoreEntry: Equatable {
   var root: URL
   /// `bin/bright-sight.js`。
   var script: URL
+  /// 包内自带的那份 node。
+  ///
+  /// 可选的，因为开发期的仓库根没有这一份——`build-app.sh` 只在打包时才拷进来。
+  /// 缺了就回退到 PATH 上的 node，那是开发机的正常状态。
+  var node: URL?
 }
 
 /// 核心在哪。
@@ -60,6 +65,15 @@ enum CoreLocator {
   }
 
   private static func entry(at root: URL) -> CoreEntry {
-    CoreEntry(root: root, script: root.appendingPathComponent("bin/bright-sight.js"))
+    let node = root.appendingPathComponent("node")
+    return CoreEntry(
+      root: root,
+      script: root.appendingPathComponent("bin/bright-sight.js"),
+      // 判据用 isExecutableFile 而不是 fileExists。拷进来的 node 完全可能「在，但没有执行位」
+      // ——zip 解压、某些同步工具、一部分 cp 变体都会把权限位丢掉。那时候 fileExists 照样通过，
+      // 失败点被推到 exec 那一刻，而现场只剩一句语焉不详的权限错误；回退 PATH 也救不回来，
+      // 因为用户机器上本来就没有 node。在这里就判死，能回退的回退，回退不了的第一条指令就报错。
+      node: FileManager.default.isExecutableFile(atPath: node.path) ? node : nil
+    )
   }
 }

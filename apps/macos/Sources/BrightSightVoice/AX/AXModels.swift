@@ -41,11 +41,36 @@ struct AXTraversalBudget: Equatable, Sendable {
   let maxMilliseconds: Int
   let pageSize: Int
 
+  /// 请求没带 `depth` / `nodes` / `ms` 时用的默认档。
+  ///
+  /// 单独起名、写成 `static let` 有两条理由：`protectiveDefault` 直接**引用**它们，于是
+  /// 「默认预算」在源码里只有一个来源；`test/ax.test.ts` 的跨语言门禁用 `static let <name> = N`
+  /// 的形式取值，写死在 `protectiveDefault` 括号里的字面量它抓不到。
+  ///
+  /// 数字取自真机实测（Chrome 的前台窗口，生产口径每节点读 10 个属性），分两页量：
+  ///
+  /// | 页面 | depth/nodes/ms | 可动作元素 | 遍历节点 | 耗时 | 截断 |
+  /// | --- | --- | --- | --- | --- | --- |
+  /// | GitHub 首页 | 6 / 500 / 150（原生产值） | 4 | 22 | 27ms | depth |
+  /// | GitHub 首页 | 12 / 800 / 150 | 67 | 231 | 44ms | depth |
+  /// | GitHub 首页 | 16 / 800 / 150 | 141（全部） | 536 | 107ms | depth |
+  /// | GitHub 首页 | 20 / 800 / 150 | 141（全部） | — | 101ms | 完成 |
+  /// | 长文页（小林 coding） | 20 / 800 / 150 | 40 | 569 | 152ms | deadline |
+  /// | 长文页 | 20 / 2000 / 300 | ~130 | 1787 | ~300ms | deadline |
+  ///
+  /// 由此定档：depth 20（GitHub 18 起走完，留一档余量）；nodes 2000（GitHub 只需约 540，
+  /// 长文页在 300ms 内到 1787 也够）；ms 300——GitHub 仍在 ~110ms 走完、不受影响，长文页
+  /// 从「40 个」提到「~130 个」，而 300ms 相对模型那几秒的延迟可以忽略。
+  static let defaultMaxDepth = 20
+  static let defaultMaxNodes = 2000
+  static let defaultMaxMilliseconds = 300
+  static let defaultPageSize = 80
+
   static let protectiveDefault = AXTraversalBudget(
-    maxDepth: 6,
-    maxNodes: 500,
-    maxMilliseconds: 150,
-    pageSize: 80
+    maxDepth: defaultMaxDepth,
+    maxNodes: defaultMaxNodes,
+    maxMilliseconds: defaultMaxMilliseconds,
+    pageSize: defaultPageSize
   )
 
   init(maxDepth: Int, maxNodes: Int, maxMilliseconds: Int, pageSize: Int) {
@@ -57,6 +82,19 @@ struct AXTraversalBudget: Equatable, Sendable {
     self.maxNodes = maxNodes
     self.maxMilliseconds = maxMilliseconds
     self.pageSize = pageSize
+  }
+
+  /// 按请求里的可选覆盖项派生这一轮的实际预算。`nil` = 请求没给这一项，保留基准值。
+  ///
+  /// 「不给」等于「用基准值」，不等于「不限」——缺省站在保守那一边。越界值在这之前
+  /// 已被 `AXObserveParams` 按 `AXWireLimits` 拒掉，这里不再重复校验。
+  func overridden(maxDepth: Int?, maxNodes: Int?, maxMilliseconds: Int?) -> AXTraversalBudget {
+    AXTraversalBudget(
+      maxDepth: maxDepth ?? self.maxDepth,
+      maxNodes: maxNodes ?? self.maxNodes,
+      maxMilliseconds: maxMilliseconds ?? self.maxMilliseconds,
+      pageSize: pageSize
+    )
   }
 }
 
@@ -186,6 +224,20 @@ enum AXWireLimits {
   /// 向上找区分文字的最大层数。真机实测（Chrome 的 GitHub 页面，141 个可动作元素、8 组同名）
   /// 四组分别在第 1、1、2、3 层被区分开，3 层是实测够用的上限。
   static let maxContextLevels = 3
+
+  /// 单次观察允许请求的最大遍历深度。
+  ///
+  /// 上限不是「实测完成档」本身（那是 20，也是默认档），而是它之上再留一档余量：真正的时间兜底
+  /// 是 `maxMilliseconds`，深度只用来拦住明显离谱的请求。32 对任何真实网页都够，再深只会拖住对端。
+  static let maxDepth = 32
+
+  /// 单次观察允许请求的最大遍历节点数。GitHub 首页整棵树约 540 个节点；长文页 5000 个都还没走完，
+  /// 但那种页面由 ms 截止兜住，5000 只是拦住明显离谱的请求。
+  static let maxNodes = 5000
+
+  /// 单次观察允许请求的最大耗时预算（毫秒）。它才是真正的时间兜底：长文页的树深到走不完，
+  /// 靠这个数保证观察不会挂住用户的应用。3000 是个宽裕的上限，生产默认只用 300。
+  static let maxMilliseconds = 3000
 }
 
 struct AXObserveParams: Equatable, Sendable {
@@ -193,6 +245,13 @@ struct AXObserveParams: Equatable, Sendable {
   let processID: pid_t?
   let offset: Int
   let pageSize: Int?
+  /// 遍历预算的三个覆盖项。`nil` = 这一项没请求，由 `AXTraversalBudget.overridden` 退回基准值。
+  ///
+  /// 三个都做成请求参数是因为它们互相牵制：只把 depth 提上去而节点数不变，结果只是把
+  /// 「depth 截断」换成「nodes 截断」，网页照样看不全。
+  let depth: Int?
+  let nodes: Int?
+  let milliseconds: Int?
 
   init(json: JSONValue) throws {
     guard let fields = json.objectValue else {
@@ -218,10 +277,31 @@ struct AXObserveParams: Equatable, Sendable {
     if let pageSize, !(1...AXWireLimits.maxPageSize).contains(pageSize) {
       throw CoreError(.invalidParams, "pageSize 必须在 1...\(AXWireLimits.maxPageSize)")
     }
+    // 上限卡在解析层，越界值当场拒掉而不是夹到边界：夹等于替调用方猜它想要什么，
+    // 而「传了个我没法用的值」要让它当场可见（`CLAUDE.md` 三、缺省值一律 fail-closed）。
+    self.depth = try Self.boundedInt(fields["depth"], key: "depth", range: 0...AXWireLimits.maxDepth)
+    self.nodes = try Self.boundedInt(fields["nodes"], key: "nodes", range: 1...AXWireLimits.maxNodes)
+    self.milliseconds = try Self.boundedInt(
+      fields["ms"],
+      key: "ms",
+      range: 1...AXWireLimits.maxMilliseconds
+    )
     self.scope = scope
     self.processID = pid
     self.offset = offset
     self.pageSize = pageSize
+  }
+
+  /// 解析一个可选的有界整数参数。
+  ///
+  /// **字段在但值不合法**（越界、不是整数）时抛错，绝不静默退回缺省：「不传」才是缺省，
+  /// 「传了个我没法用的值」是调用方的缺陷，退回缺省会让它变成一次看起来正常的浅观察。
+  private static func boundedInt(_ value: JSONValue?, key: String, range: ClosedRange<Int>) throws -> Int? {
+    guard let value else { return nil }
+    guard let raw = value.intValue, range.contains(raw) else {
+      throw CoreError(.invalidParams, "\(key) 必须在 \(range.lowerBound)...\(range.upperBound)")
+    }
+    return raw
   }
 }
 

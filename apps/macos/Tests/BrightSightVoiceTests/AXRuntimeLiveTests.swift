@@ -115,6 +115,80 @@ final class AXRuntimeLiveTests: XCTestCase {
     }
   }
 
+  /// 真机量一遍遍历预算：同一页面上不同 depth/nodes/ms 各能看见多少可动作元素、走到多深、
+  /// 为什么停下。§1.1 的验收（Chrome 的 GitHub 页面出现 40+ 可动作元素、不再报 depth 截断、
+  /// 耗时在预算内）靠它取证——单元测试里的树是我们自己造的，证明不了真实网页长什么样。
+  ///
+  /// 断言刻意只钉**形状**而不钉具体数字：页面随用户当时开着什么而变，钉死数量会变成随桌面状态
+  /// 随机红的噪声源。真正的信息在打印出来的那张表里——看不懂的数字不能当成通过。
+  func testTraversalBudgetTiersOnChromePrintTheActionableSurface() async throws {
+    guard ProcessInfo.processInfo.environment["BRIGHTSIGHT_LIVE"] == "1" else {
+      throw XCTSkip("设 BRIGHTSIGHT_LIVE=1 才跑真实 AX 调用")
+    }
+    guard AXIsProcessTrusted() else {
+      throw XCTSkip("当前测试宿主没有 Accessibility 权限")
+    }
+    // 按 bundle id 定位 Chrome，而不是「取前台应用」：免得为了量一条测试去抢用户的焦点。
+    // 与 `testObserveFinderWithoutPerformingAnAction` 里用 `com.apple.finder` 是同一个路数——
+    // bundle id 是应用身份，不是随机器变的数据。
+    guard let chrome = NSWorkspace.shared.runningApplications.first(where: {
+      $0.bundleIdentifier == "com.google.Chrome"
+    }) else {
+      throw XCTSkip("Chrome 当前没有运行")
+    }
+
+    // 第一档是**改之前的**生产值（depth 6），用来对照「看不到网页内容」这个现象；
+    // 中间那档是 §1.1 的建议值；最后一档是本次定下的生产默认档，验收靠它取证。
+    let tiers = [
+      AXTraversalBudget(maxDepth: 6, maxNodes: 500, maxMilliseconds: 150, pageSize: 200),
+      AXTraversalBudget(maxDepth: 12, maxNodes: 800, maxMilliseconds: 150, pageSize: 200),
+      AXTraversalBudget(
+        maxDepth: AXTraversalBudget.defaultMaxDepth,
+        maxNodes: AXTraversalBudget.defaultMaxNodes,
+        maxMilliseconds: AXTraversalBudget.defaultMaxMilliseconds,
+        pageSize: 200
+      ),
+    ]
+
+    print("── 真机遍历预算：\(chrome.localizedName ?? "Chrome") pid=\(chrome.processIdentifier) 前台=\(NSWorkspace.shared.frontmostApplication?.localizedName ?? "?") ──")
+    print("  depth/nodes/ms | 可动作元素 | 遍历节点 | 耗时 | 截断原因")
+    for tier in tiers {
+      let runtime = AXRuntime(budget: tier)
+      let observed: JSONValue
+      do {
+        observed = try await call { completion in
+          runtime.observe(params: .object([
+            "scope": .string("focusedWindow"),
+            "pid": .number(Double(chrome.processIdentifier)),
+            "depth": .number(Double(tier.maxDepth)),
+            "nodes": .number(Double(tier.maxNodes)),
+            "ms": .number(Double(tier.maxMilliseconds)),
+            "pageSize": .number(200),
+          ]), completion: completion)
+        }
+      } catch {
+        // 一棵树在遍历期间会继续变化，单档失败不该带走整张表——如实打出来，接着量下一档
+        print("  \(tier.maxDepth)/\(tier.maxNodes)/\(tier.maxMilliseconds) | 观察失败：\(error)")
+        continue
+      }
+      let total = observed["page"]?["total"]?.intValue ?? -1
+      let elapsed = observed["elapsedMs"]?.intValue ?? -1
+      let truncation = observed["truncated"]
+      // 遍历节点数只在被截断时随 truncated 上报；走完整棵树时线上没有这个数，
+      // 如实打「—」而不是编一个。
+      let nodesText = truncation?["nodes"]?.intValue.map(String.init) ?? "—"
+      let reason = truncation?["reason"]?.stringValue ?? "完成"
+      print("  \(tier.maxDepth)/\(tier.maxNodes)/\(tier.maxMilliseconds) | \(total) | \(nodesText) | \(elapsed)ms | \(reason)")
+      // 打几条样本标签：数字对不上预期时，先要能回答「我看的到底是哪个页面」。
+      // 头部的是浏览器自己的工具栏，尾部才是网页内容——两头都打。
+      // 看不懂的数字不能当成通过，上一轮那个 `-25200` 就是这么查出来的。
+      let labels = (observed["offers"]?.arrayValue ?? []).compactMap { $0["target"]?["label"]?.stringValue }
+      let head = labels.prefix(3).joined(separator: " / ")
+      let tail = labels.suffix(3).joined(separator: " / ")
+      if !labels.isEmpty { print("      头：\(head)　尾：\(tail)") }
+    }
+  }
+
   private func call(
     _ start: (@escaping AXRuntime.Completion) -> Void
   ) async throws -> JSONValue {

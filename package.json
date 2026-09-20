@@ -18,7 +18,8 @@
     "test:live": "BRIGHTSIGHT_LIVE=1 node --test 'test/**/*.test.ts'",
     "voice:test": "swift test --package-path apps/macos",
     "voice:build": "bash apps/macos/scripts/build-app.sh",
-    "voice:open": "bash apps/macos/scripts/build-app.sh --open"
+    "voice:open": "bash apps/macos/scripts/build-app.sh --open",
+    "release:dmg": "bash apps/macos/scripts/make-dmg.sh"
   },
   "dependencies": {
     "@typesafe-ai/sdk": "^0.6.0"

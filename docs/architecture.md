@@ -33,10 +33,13 @@
    ├─ 动作面    actions.ts    扫全盘 .app 解析 sdef → ActionSpec（带磁盘缓存）
    │            surface.ts    REGISTRY 键集 ∩ ALLOWED_APPS + 任务层动作（ASK/WAIT/DONE/BLOCKED/UNSUPPORTED）
    │            spans.ts      中文候选片段枚举
+   │            ax.ts         走 RPC 向 Swift 的 AXRuntime 要一次无障碍树观察，产出 offer
+   │                          与脚本动作面合成同一张选项表；只在 cmdServe 上有接线
    ├─ judge     decide.ts     闭环走 judge(TypeSafeClient)→Decision；DecisionBackend 只服务 probe
    ├─ 策略      policy.ts     纯函数阈值链 + 四道硬闸 → 5 态 + reasons[]
    ├─ act       execute.ts    参数解析 + 回读解析（resolveArgs 按模板 id 两个硬编码分支）
    │            scripts.ts    冻结的脚本模板注册表（2 条可执行：make-tab / make-note）
+   │            capability.ts 能力适配器：动作怎么解析、怎么执行收敛到唯一一处
    │            osa.ts        唯一 spawn osascript 的出口，argv 传参边界
    ├─ verify    verify.ts     返回值 + 计数 diff + 定向回读；模型不自证
    ├─ 编排      loop.ts       observe→judge→policy→act→verify；确认挂起 / 验证失败换路是两条恢复路径
@@ -53,10 +56,12 @@
 | `actions.ts` | 扫 sdef 生成动作面，带磁盘缓存 | 唯一写 `surface.json` 的地方。`kind` 只构造 `"script"` |
 | `surface.ts` | 允许清单过滤，拼任务层动作 | 执行允许清单就是 `scripts.ts` 的键集。每次 handle 重取的仍是这张冻结表 |
 | `spans.ts` | 中文候选片段枚举 | 纯函数，零 IO |
+| `ax.ts` | 无障碍树观察的跨语言契约：入出参校验与 `operation + role` → 能力映射 | 不 spawn 任何 Apple Event。对超限是**校验**不是截断——超限说明对侧漏了截断，那是缺陷；常量与 Swift `AXWireLimits` 成对，靠跨语言门禁对账 |
 | `decide.ts` | 构建选择题，校验模型答案 | 闭环走 `judge(client)`。`DecisionBackend` 不是闭环 Seam |
 | `policy.ts` | 五态收敛 + 四道硬闸 | **零 IO、零网络、纯函数**。需要外部信息一律作为参数传入 |
 | `execute.ts` | 参数解析、回读解析 | 不自己 spawn，走 `osa.ts` |
 | `scripts.ts` | 脚本模板注册表 | 模板内容冻结，值永不插值进脚本文本 |
+| `capability.ts` | 能力适配器：`script` / `ax` 两条动作的统一解析与执行入口 | AX 动作**不在** `scripts.ts` 的键集里，所以脚本那条执行允许清单管不到它；AX 的准入由 `policy.ts` 按 `effect` / `risk` 判定 |
 | `osa.ts` | 唯一 spawn `osascript` 的出口 | `execFile` 无 shell，值只走 argv |
 | `verify.ts` | 返回值加快照 diff 判定 | 模型不参与，全部由代码判定 |
 | `loop.ts` | 四步编排与确认挂起 | 全部依赖都是函数参数。`waiting_for_confirmation` 可 resume；`needs_input` 不能 |
@@ -72,13 +77,14 @@
 | `config.ts` | 应用白名单、搜索引擎模板、代码兜底上限 | |
 | `cli.ts` | 命令入口与生产装配 | `run` 直接 loop；`serve` 拼 SessionDeps；`journal` / `profile` / `probe` 各有独立不变量 |
 
-## 三条不变量
+## 四条不变量
 
-这三条是架构的地基，改动前想清楚：
+这四条是架构的地基，改动前想清楚：
 
 1. **`osa.ts` 是唯一 spawn 点。** 任何新增的 Apple Event 都必须从这里出去，否则 argv 不变式就有了缺口。
 2. **`policy.ts` 零 IO。** 它是安全边界，必须能被穷举测试。需要外部信息就加参数，不要在里面读盘或发请求。
-3. **执行允许清单等于 `scripts.ts` 的键集。** 不存在第二处定义。加动作意味着加模板，加模板意味着过 `osacompile` 门禁。
+3. **脚本动作的执行允许清单等于 `scripts.ts` 的键集。** 不存在第二处定义。加脚本动作意味着加模板，加模板意味着过 `osacompile` 门禁。（这一条**只管脚本动作**：AX 动作不在键集里，它的准入由 `policy.ts` 按 `effect` / `risk` 判定。）
+4. **AX 动作的 `offerId` 只在产生它的那个 `frameId` 里有效。** 两者必须一起走到底——重新观察一次就作废，不能让上一轮的目标 id 落到新一帧上。跨进程的 `ax.perform` 校验的就是这一对。
 
 ## 为什么安全核心是三个独立文件
 

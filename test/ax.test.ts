@@ -2,10 +2,16 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import {
+  AX_DEFAULT_DEPTH,
+  AX_DEFAULT_MILLISECONDS,
+  AX_DEFAULT_NODES,
   AX_EDITABLE_ROLES,
   AX_LINK_ROLE,
   AX_MAX_CONTEXT_CHARACTERS,
   AX_MAX_CONTEXT_LEVELS,
+  AX_MAX_DEPTH,
+  AX_MAX_MILLISECONDS,
+  AX_MAX_NODES,
   AX_MAX_PAGE_SIZE,
   AX_MENU_ITEM_ROLE,
   AX_METHOD_OBSERVE,
@@ -140,6 +146,20 @@ function swiftIntLimit(source: string, name: string): number | undefined {
   return match ? Number(match[1]) : undefined;
 }
 
+/**
+ * 抽出 `static let protectiveDefault = AXTraversalBudget(…)` 每个字段的值表达式。
+ *
+ * `swiftIntLimit` 只认 `static let <name> = N`，抓不到这个**组装表达式**里的参数——于是有人把
+ * `maxDepth: defaultMaxDepth` 改回字面量 `maxDepth: 6` 时，那几条「默认值一致」的门禁看不见，
+ * 生产默认档会在绿灯下静默漂走。这里只把**标识符**形式的参数捞出来：字面量不会进结果，
+ * 比对当场红。所以它和 `swiftIntLimit` 一起用才能钉死「默认预算值」这一个数。
+ */
+function swiftProtectiveDefaultArgs(source: string): string[] {
+  const block = /static let protectiveDefault = AXTraversalBudget\(([\s\S]*?)\)/.exec(source);
+  if (!block) return [];
+  return [...block[1]!.matchAll(/(\w+):\s*([A-Za-z_][\w.]*)/g)].map((match) => match[2]!);
+}
+
 test("AX 方法名在 Node 三处与 Swift 影子之间一致", async () => {
   const swiftMethods = swiftWireMethodNames(await readFile(SWIFT_CORE_PROTOCOL, "utf8"));
 
@@ -184,6 +204,84 @@ test("区分文字的两个限额在 Node 与 Swift 之间一致", async () => {
   );
 });
 
+test("遍历预算的上限与默认值在 Node 与 Swift 之间一致", async () => {
+  const source = await readFile(SWIFT_AX_MODELS, "utf8");
+
+  // 上限：Swift 放在 AXWireLimits 里，Node 侧用来校验请求
+  assert.equal(swiftIntLimit(source, "maxDepth"), AX_MAX_DEPTH, "AXWireLimits.maxDepth 与 AX_MAX_DEPTH 漂移了");
+  assert.equal(swiftIntLimit(source, "maxNodes"), AX_MAX_NODES, "AXWireLimits.maxNodes 与 AX_MAX_NODES 漂移了");
+  assert.equal(
+    swiftIntLimit(source, "maxMilliseconds"),
+    AX_MAX_MILLISECONDS,
+    "AXWireLimits.maxMilliseconds 与 AX_MAX_MILLISECONDS 漂移了",
+  );
+  // 默认值：请求不带 depth/nodes/ms 时用的那一档，必须同时钉住——只钉上限的话，
+  // 「默认档偷偷退回 6」这种正是本次要修的缺陷可以全绿通过
+  assert.equal(swiftIntLimit(source, "defaultMaxDepth"), AX_DEFAULT_DEPTH, "默认 depth 漂移了");
+  assert.equal(swiftIntLimit(source, "defaultMaxNodes"), AX_DEFAULT_NODES, "默认 nodes 漂移了");
+  assert.equal(
+    swiftIntLimit(source, "defaultMaxMilliseconds"),
+    AX_DEFAULT_MILLISECONDS,
+    "默认 ms 漂移了",
+  );
+  // 上面那几条只证明了「这几个常量是这个数」。默认预算是一个组装表达式，得再确认它**引用**了
+  // 这些常量，否则字面量可以被塞回 protectiveDefault 而门禁看不见（现有提取器的覆盖缺口）。
+  assert.deepEqual(
+    swiftProtectiveDefaultArgs(source),
+    ["defaultMaxDepth", "defaultMaxNodes", "defaultMaxMilliseconds", "defaultPageSize"],
+    "protectiveDefault 必须由具名常量组装，不能内联字面量——否则那几个默认常量是没人用的摆设",
+  );
+});
+
+test("depth / nodes / ms 的校验：超限拦得住、边界放行、缺省不冒出新字段", async () => {
+  // 拦得住：越界（上界 +1 与下界 -1 / 0）
+  for (const bad of [
+    { depth: AX_MAX_DEPTH + 1 },
+    { depth: -1 },
+    { nodes: AX_MAX_NODES + 1 },
+    { nodes: 0 },
+    { ms: AX_MAX_MILLISECONDS + 1 },
+    { ms: 0 },
+  ]) {
+    await assert.rejects(
+      observeAX(peerReturning({}), { scope: "application", ...bad }),
+      (error: unknown) => error instanceof RpcFailure && error.code === "invalid_params",
+      `超限的 ${JSON.stringify(bad)} 必须被拦下`,
+    );
+  }
+
+  // 优先级 / 不越界：恰好等于上限要放行，且**原样**发给对端，不被夹到别的值；
+  // 只给一项时另外两项不出现在线参数里（省略 = 对端默认档，不是本侧替它编一个值）
+  const seen: Array<{ method: string; params: unknown }> = [];
+  await observeAX(peerReturning(observeWith({}), seen), {
+    scope: "application",
+    depth: AX_MAX_DEPTH,
+    nodes: AX_MAX_NODES,
+    ms: AX_MAX_MILLISECONDS,
+  });
+  assert.deepEqual(
+    seen[0]!.params,
+    { scope: "application", depth: AX_MAX_DEPTH, nodes: AX_MAX_NODES, ms: AX_MAX_MILLISECONDS },
+    "边界值必须原样上发，不能被悄悄夹小",
+  );
+
+  const onlyDepth: Array<{ method: string; params: unknown }> = [];
+  await observeAX(peerReturning(observeWith({}), onlyDepth), { scope: "focusedWindow", depth: AX_DEFAULT_DEPTH });
+  assert.deepEqual(
+    onlyDepth[0]!.params,
+    { scope: "focusedWindow", depth: AX_DEFAULT_DEPTH },
+    "只给 depth 时另外两项不能凭空出现在线上——省略等于用对端默认档",
+  );
+
+  const none: Array<{ method: string; params: unknown }> = [];
+  await observeAX(peerReturning(observeWith({}), none), { scope: "focusedWindow" });
+  assert.deepEqual(
+    none[0]!.params,
+    { scope: "focusedWindow" },
+    "一个预算项都不给时，线上参数与引入 depth 之前逐字段相等",
+  );
+});
+
 test("跨语言对照测试本身有效：字面量一改就会被发现", () => {
   // 没有这条，上面两条可以退化成「提取器永远返回空/期望值」而全绿。
   assert.deepEqual(
@@ -195,6 +293,24 @@ test("跨语言对照测试本身有效：字面量一改就会被发现", () =>
   assert.equal(swiftIntLimit("// 这个文件里没有那个常量", "maxPageSize"), undefined, "找不到时必须返回 undefined 而不是凑一个值");
   // 按名字取就必须真的分得清名字：两个常量挨着放时，不能拿前一个的值去答后一个。
   assert.equal(swiftIntLimit("static let maxContextCharacters = 200\nstatic let maxContextLevels = 3", "maxContextLevels"), 3);
+  // 默认值在 `defaultMaxDepth` 里时，按 `maxDepth` 取不能把它误认成上限。
+  assert.equal(swiftIntLimit("static let maxDepth = 20\nstatic let defaultMaxDepth = 12", "maxDepth"), 20);
+  assert.equal(swiftIntLimit("static let maxDepth = 20\nstatic let defaultMaxDepth = 12", "defaultMaxDepth"), 12);
+  // 组装表达式提取器：具名常量要捞得到，字面量必须一个都捞不到（否则「引用了常量」这条判据会假绿）
+  assert.deepEqual(
+    swiftProtectiveDefaultArgs(
+      "static let protectiveDefault = AXTraversalBudget(maxDepth: defaultMaxDepth, maxNodes: defaultMaxNodes)",
+    ),
+    ["defaultMaxDepth", "defaultMaxNodes"],
+  );
+  assert.deepEqual(
+    swiftProtectiveDefaultArgs(
+      "static let protectiveDefault = AXTraversalBudget(maxDepth: 6, maxNodes: 500, maxMilliseconds: 150, pageSize: 80)",
+    ),
+    [],
+    "内联字面量时必须一个参数都捞不到——这才抓得住「有人把常量改回数字」",
+  );
+  assert.deepEqual(swiftProtectiveDefaultArgs("// 这个文件里没有那个组装表达式"), []);
   assert.deepEqual(swiftWireMethodNames("static let methodSessionHandle = \"session.handle\""), []);
 });
 

@@ -20,6 +20,41 @@ export const AX_MAX_CONTEXT_CHARACTERS = 200;
 /** 向上找区分文字的最大层数，与 Swift `AXWireLimits.maxContextLevels` 成对。本侧不使用，只做门禁对照。 */
 export const AX_MAX_CONTEXT_LEVELS = 3;
 
+/**
+ * 单次观察可请求的遍历预算上限，与 Swift `AXWireLimits` 的 `maxDepth` / `maxNodes` /
+ * `maxMilliseconds` 成对。
+ *
+ * 本侧是**校验**而不是裁剪：超限说明调用方算错了预算，那是缺陷，不该由本侧悄悄抹平成上限。
+ * 上限是「实测完成档之上再留一档余量」——真正的时间兜底是对侧的 ms 截止，深度与节点数只用来
+ * 拦住明显离谱的请求。
+ */
+export const AX_MAX_DEPTH = 32;
+export const AX_MAX_NODES = 5000;
+export const AX_MAX_MILLISECONDS = 3000;
+
+/**
+ * 请求不带 `depth` / `nodes` / `ms` 时，Swift 用的默认档（`AXTraversalBudget.protectiveDefault`）。
+ *
+ * 生产路径（`cli.ts` 的 `cmdServe`）**显式**带上这三个值，这组常量就是那份显式请求的取值；
+ * `test/ax.test.ts` 末尾的跨语言门禁逐条比对它和 Swift 默认值。缺省语义是保守的：
+ * 不带字段 = 用这些值，不是「不限」，也不是「放大到上限」。
+ *
+ * 取值来自真机实测（见 `AXTraversalBudget.protectiveDefault` 的表格）：depth 6 在 GitHub 上只看得见
+ * 4 个可动作元素，20 走完整棵树、141 个全进动作面；长文页在 150ms 内只够 40 个，300ms 才到 ~130。
+ */
+export const AX_DEFAULT_DEPTH = 20;
+export const AX_DEFAULT_NODES = 2000;
+export const AX_DEFAULT_MILLISECONDS = 300;
+
+/**
+ * 一次观察为什么没走完整棵树。与 Swift `AXTruncation.Reason` 成对。
+ *
+ * `depth` 撞到深度上限、`nodes` 撞到节点数上限、`deadline` 撞到耗时预算。
+ * 它和分页的 `nextOffset` 是两个独立的信号：这里是「树没走完」，那里是「走完了但这一页装不下」。
+ */
+export type AxTruncationReason = "depth" | "nodes" | "deadline";
+export type AxTruncation = { reason: AxTruncationReason; depth: number; nodes: number; ms: number };
+
 export type AxObservationScope = "focusedWindow" | "application";
 export type AxOperation = "CLICK" | "TYPE_TEXT" | "SELECT" | "OPEN";
 export type AxEffect = "read" | "navigate" | "draft" | "submit" | "change" | "destroy";
@@ -30,6 +65,16 @@ export type AxObserveParams = {
   pid?: number;
   offset?: number;
   pageSize?: number;
+  /**
+   * 这一轮遍历的预算覆盖项。省略 = 用对端 `protectiveDefault` 的对应值，不放大。
+   *
+   * 三项都做成请求参数而不是只放 `depth`：它们互相牵制——depth 提上去而 nodes 不变，
+   * 结果只是把「depth 截断」换成「nodes 截断」；而 `ms` 是唯一需要按页面实测调的。
+   * `validateObserveParams` 把三者卡在 `AX_MAX_*` 之内。
+   */
+  depth?: number;
+  nodes?: number;
+  ms?: number;
 };
 
 export type AxActionOffer = {
@@ -58,7 +103,7 @@ export type AxObserveResult = {
   offers: AxActionOffer[];
   page: { offset: number; count: number; total: number; nextOffset?: number };
   elapsedMs: number;
-  truncated?: { reason: "depth" | "nodes" | "deadline"; depth: number; nodes: number; ms: number };
+  truncated?: AxTruncation;
 };
 
 export type AxPerformParams = {
@@ -100,6 +145,16 @@ export type AxExecContext = {
   frameId: string;
   offers: readonly AxActionOffer[];
   app: string;
+  /**
+   * 这一帧的遍历是否被截断。省略 = 走完了整棵树。
+   *
+   * 决策层靠它知道「界面上还有没展示出来的目标」，留痕靠它看出这次观察是不是残缺的
+   * （见 `loop.ts` 的 observe 事件与 `redact.ts` 的 observe 分支）。它从观察那一刻就与 frame
+   * 绑在一起，所以随 frame 一起流到这里，而不是在 loop 里另开一条通道。
+   */
+  truncated?: AxTruncation;
+  /** 分页的下一页 offset。省略 = 动作面已到末尾。本轮不做翻页动作，只保留这个位置。 */
+  nextOffset?: number;
 };
 
 export type AxPeer = Pick<RpcPeer, "call">;
@@ -139,6 +194,17 @@ function validateObserveParams(params: AxObserveParams): void {
     (!Number.isSafeInteger(params.pageSize) || params.pageSize < 1 || params.pageSize > AX_MAX_PAGE_SIZE)
   ) {
     invalid(`pageSize 必须在 1...${AX_MAX_PAGE_SIZE}`);
+  }
+  // 三个遍历预算覆盖项：省略走对端默认档，给了就必须落在实测过的范围内。
+  // `depth` 允许 0（只看根节点），与 Swift 的 `precondition(maxDepth >= 0)` 对齐。
+  if (params.depth !== undefined && (!Number.isSafeInteger(params.depth) || params.depth < 0 || params.depth > AX_MAX_DEPTH)) {
+    invalid(`depth 必须在 0...${AX_MAX_DEPTH}`);
+  }
+  if (params.nodes !== undefined && (!Number.isSafeInteger(params.nodes) || params.nodes < 1 || params.nodes > AX_MAX_NODES)) {
+    invalid(`nodes 必须在 1...${AX_MAX_NODES}`);
+  }
+  if (params.ms !== undefined && (!Number.isSafeInteger(params.ms) || params.ms < 1 || params.ms > AX_MAX_MILLISECONDS)) {
+    invalid(`ms 必须在 1...${AX_MAX_MILLISECONDS}`);
   }
 }
 

@@ -125,9 +125,17 @@ function redactEvent(phase: string, data: unknown, salt: string): unknown {
       // utterance 是用户原话，整条都是内容
       return { ...d, utterance: typeof d.utterance === "string" ? fingerprint(d.utterance, salt) : d.utterance };
 
-    case "observe":
-      // front 是应用名（本系统常量 / 系统进程名），保留；window 是窗口标题，是内容
-      return { ...d, window: typeof d.window === "string" ? fingerprint(d.window, salt) : d.window };
+    case "observe": {
+      // front 是应用名（本系统常量 / 系统进程名），保留；window 是窗口标题，是内容。
+      // AX 完整度那三项是结构、不含用户内容：`axTruncated` 是枚举（depth/nodes/deadline 或 null），
+      // `axNodes` / `axNextOffset` 是数字或 null。它们正是「这次观察是不是残缺的」唯一线索，
+      // 所以显式放行——但**逐条列出**，不靠「其余透传」：白名单之外一律按内容指纹化，
+      // 以后往这条事件里加字符串字段时的默认后果是「信息变少」，不是「原文落盘」。
+      const keep = new Set(["front", "axTruncated", "axNodes", "axNextOffset"]);
+      const out: Rec = {};
+      for (const [k, v] of Object.entries(d)) out[k] = keep.has(k) ? v : deep(v, salt);
+      return out;
+    }
 
     case "judge": {
       // judgement 全是数值与后端名，保留；span 是从用户原话切出来的片段，是内容。

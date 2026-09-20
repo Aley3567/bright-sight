@@ -12,6 +12,8 @@
   <string>dev.yufeng.brightsight.voice</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
   <key>CFBundleName</key>
   <string>Bright Sight</string>
   <key>CFBundlePackageType</key>

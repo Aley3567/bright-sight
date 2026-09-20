@@ -2,7 +2,9 @@
 
 bright-sight 把一句中文指令变成受控的应用操作，每一步执行完都由代码回读验证。感知不看屏幕像素，来源是无障碍树和应用脚本字典。
 
-它现在只能做两件事：在 Chrome 里开标签页、在备忘录里建笔记。真正花力气的部分是保证它只做这两件。入口有两个：命令行 `bright-sight run`，以及菜单栏胶囊（按住右 Command 说话或输入文字）。胶囊走长驻 `bright-sight serve`，不解析 CLI 的中文 stdout。
+动作分两类。**脚本动作**走冻结的 AppleScript 模板，目前只有两条：在 Chrome 里开标签页、在备忘录里建笔记。**界面动作**走无障碍树（下称 AX），在焦点窗口里找出可点击、可输入、可选中的元素直接下手——这一类不写脚本，所以不受「只有两条模板」的限制。两类动作的每一步都由代码回读验证，这个项目真正花力气的部分就是保证它只做该做的。
+
+入口有两个：菜单栏胶囊（按住右 Command 说话，或直接输入文字，走长驻 `bright-sight serve`），以及命令行 `bright-sight run`。**命令行那条只有脚本动作**，界面动作只在胶囊这条路上有，原因见下文。
 
 ```sh
 bright-sight run "搜一下 TypeScript 的 erasableSyntaxOnly，把链接存进备忘录" --execute
@@ -37,28 +39,46 @@ Chrome: 当前 Chrome profile <目录名> 不在允许名单内
 
 ## 能做什么，不能做什么
 
-感知不看屏幕像素，来源是无障碍树和应用脚本字典（sdef），不截图也不做 OCR。动作面从系统自己长出来：扫描全盘 `.app` 的 sdef，解析出所有可脚本化命令。数量取决于你机器上装了什么，跑 `bright-sight surface` 看本机的数。
+感知不看屏幕像素，来源是应用脚本字典（sdef）与无障碍树（AX），不截图也不做 OCR。动作面从系统自己长出来：扫描全盘 `.app` 的 sdef，解析出所有可脚本化命令；再观察焦点窗口的无障碍树，取出可动作的元素。两者的数量都取决于你机器上装了什么、当时开着什么，跑 `bright-sight surface` 看本机的数。
 
 决策交给 [TypeSafe](https://typesafe.ai) 的 System One 模型，它只回答类型化选择题并返回概率分布，不生成任何文本。控制流完全归代码所有。
 
 不能做的事，先说清楚：
 
 - **不能指定 Chrome profile。** Chrome 的脚本字典里没有 profile 这个概念，AppleScript 侧无解。这个工具能做的是执行前探测当前在用哪个 profile，陌生的就停下来问。
-- **动作面能解析出全机所有可脚本化命令，但真正能发出去的只有两条。** 扩展需要写新的脚本模板并通过 `osacompile` 门禁。
-- **命令行 `run` 没有确认入口。** 撞上 Chrome profile 闸或破坏性动作时，它会停在 `waiting_for_confirmation` 并退出。要从原处继续，走胶囊里的确认气泡，或长驻的 `serve` 通道上的 `session.confirm`。
+- **脚本动作只有两条。** 动作面能解析出全机所有可脚本化命令，但真正发得出去的模板只有 `make-tab` 与 `make-note`；扩展要写新模板并过 `osacompile` 门禁。界面动作不在此列——它不依赖模板，能操作的范围取决于当前窗口的无障碍树给了什么。
+- **界面动作受无障碍树的质量限制。** 树浅、元素不暴露、应用不支持辅助功能，都会让动作面变小甚至变空。观察有深度、节点数与耗时三重预算，被截断时选项说明里会写明「还有未展示的目标」。
+- **命令行 `run` 既没有确认入口，也没有界面动作。** 它不接 AX 反向通道，动作面里只有脚本动作；撞上 Chrome profile 闸或破坏性动作时它会停在 `waiting_for_confirmation` 并退出。要从原处继续、或者要操作界面，走胶囊里的确认气泡，或长驻 `serve` 通道上的 `session.confirm`。
 - **dry-run 只能演练第一步。** 第二步的参数依赖第一步的真实回读，不执行就拿不到。所以 dry-run 不会走到 `done`，它会自己打印一句「dry-run 到此为止是正常的」。
 - **语音条已经是原生 App。** 见 [apps/macos](apps/macos/README.md)。`src/bar/` 只留了一份迁移说明，不再存放实现。
 
 ## 运行要求
 
-- **macOS。** 依赖 Apple Event 与应用脚本字典。跨平台仍是未决事项，见 [docs/agent-v2-collaboration-brief.md](docs/agent-v2-collaboration-brief.md)。
-- **Node ≥ 24。** 用原生 TypeScript 类型剥离，没有构建步骤，直接跑 `.ts`。
-- **自动化权限。** 首次执行时系统会弹窗，要求授予终端、IDE 或 Bright Sight.app 控制 System Events、备忘录与 Chrome 的权限。拒绝的话 `run` 会在轻快照那一步失败。
-- **`TYPESAFE_API_KEY`。** `run`、`probe` 与胶囊里的自然语言指令要调模型；`surface`、`profile`、`journal` 不需要。
+- **macOS 14 或更新。** 依赖 Apple Event、应用脚本字典与无障碍树。跨平台仍是未决事项，见 [docs/agent-v2-collaboration-brief.md](docs/agent-v2-collaboration-brief.md)。
+- **Node ≥ 24，只在你从源码跑命令行时才需要。** 打包好的 App 自带运行时，装完即用。核心用原生 TypeScript 类型剥离，没有构建步骤，直接跑 `.ts`。
+- **辅助功能权限。** 界面动作靠它读写其它应用的无障碍树。没授权时界面动作面是空的，脚本动作不受影响。App 会在运行期一直等着你授权，不用重启。
+- **自动化权限。** 首次执行脚本动作时系统会弹窗，要求授予终端、IDE 或 Bright Sight.app 控制 System Events、备忘录与 Chrome 的权限。拒绝的话 `run` 会在轻快照那一步失败。
+- **`TYPESAFE_API_KEY`。** `run`、`probe` 与胶囊里的自然语言指令要调模型；`surface`、`profile`、`journal` 不需要。App 通过登录 shell 读它，写在 `~/.zshrc` 里的那份会被读到。
 
 运行时依赖只有 `@typesafe-ai/sdk` 一个包，另有 `typescript` 与 `@types/node` 两个开发依赖。
 
 ## 安装
+
+### 装 App
+
+从 [Releases](https://github.com/Aley3567/bright-sight/releases) 下载 `Bright Sight-<版本>.dmg`，打开后把 Bright Sight 拖进「应用程序」。
+
+这个包是 ad-hoc 签名、**没有经过 Apple 公证**（公证要付费开发者账号，且要多等数天），所以第一次打开一定会被 Gatekeeper 拦下，那不是包坏了。放行方式随系统版本不同：
+
+- **macOS 14 及更早**：在「应用程序」里右键点它 → 选「打开」→ 弹窗里再点一次「打开」，之后正常双击。
+- **macOS 15 及更新**：系统已经不允许用右键绕过了。打开「系统设置 → 隐私与安全性」，在「安全性」一节里找到刚被拦下的那条提示，点「仍要打开」。
+- **两者通用**：`xattr -dr com.apple.quarantine "/Applications/Bright Sight.app"`，执行一次即可。
+
+dmg 里附了一份同样内容的说明文件。
+
+App 自带 Node 运行时，目标机器不用装 Node。首次运行系统会依次要辅助功能、麦克风、语音识别三项权限，都点允许。
+
+### 从源码跑命令行
 
 ```sh
 git clone https://github.com/Aley3567/bright-sight.git
@@ -101,7 +121,7 @@ bright-sight help
 
 | 命令 | 说明 |
 |---|---|
-| `run` | 走完 observe 到 verify 的闭环。默认 dry-run，`--execute` 才真发 Apple Event。`--engine` 取 `google` / `duckduckgo` / `bing`，默认 `google`。没有确认入口 |
+| `run` | 走完 observe 到 verify 的闭环，但**只有脚本动作**——这条路径没有 AX 反向通道。默认 dry-run，`--execute` 才真发 Apple Event。`--engine` 取 `google` / `duckduckgo` / `bing`，默认 `google`。没有确认入口 |
 | `serve` | 长驻 JSON Lines RPC 服务端，给人跑的是胶囊而不是这条命令 |
 | `surface` | 看动作面。`--all` 打印全部动作，`--rebuild` 绕过磁盘缓存重建 |
 | `probe` | 只决策不执行的连通性探针，走两级 route/pick，面向全量动作面，不走执行白名单 |
@@ -168,7 +188,10 @@ $ bright-sight profile
 
 - **阈值是初始猜测，还没用评测集标定。** `THRESHOLDS` 的 `execute: 0.75` / `complete: 0.6` / `destructive: 0.3` 应当在标注评测集上按误执行代价调出来，当前值是凭手感定的。这是策略不是常量。
 - **依赖 TypeSafe 的 System One 模型。** 换一个只会生成文本的模型需要重写 `decide.ts` 的整个答案校验层。「模型只回答选择题」是这个架构的前提，不是可替换细节。
-- **本机 Chrome 与备忘录之外没有验证过。** 其它应用的 sdef 能解析，但没有执行模板。
+- **脚本动作只在本机的 Chrome 与备忘录上验证过。** 其它应用的 sdef 能解析，但没有执行模板。界面动作不依赖模板，原则上作用于任何暴露无障碍树的应用，但**真机验证只覆盖了少数几个应用**，实际覆盖面远小于自动化测试数量给人的印象。
+- **界面动作的三类失败目前同形。** 没给辅助功能权限、应用不暴露无障碍树、以及我们自己的遍历有缺陷，现在都表现为「动作面变小」。区分它们需要看留痕里的细节，不能只看动作面大小。
+- **只有 Apple Silicon 构建。** Intel Mac 需要自己从源码构建，`swift build --arch` 那一侧没有验证过。
+- **没有公证，也没有自动更新。** 分发包是 ad-hoc 签名，代价是第一次打开要手动绕过 Gatekeeper；升级要自己重新下载。
 
 ## 文档
 

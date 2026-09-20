@@ -180,7 +180,7 @@ const SERVE_DRAIN_TIMEOUT_MS = 90_000;
 async function cmdServe(_args: Args): Promise<number> {
   const { offersFrom } = await import("./surface.ts");
   const { loadSurface } = await import("./actions.ts");
-  const { observeAX } = await import("./ax.ts");
+  const { observeAX, AX_DEFAULT_DEPTH, AX_DEFAULT_NODES, AX_DEFAULT_MILLISECONDS } = await import("./ax.ts");
   const { runLoop, resumeLoop } = await import("./loop.ts");
   const { judge } = await import("./decide.ts");
   const { runAction } = await import("./capability.ts");
@@ -234,16 +234,43 @@ async function cmdServe(_args: Args): Promise<number> {
         const surfaceNow = surface ?? (await loadSurface());
         const observeFrame = async (): Promise<AxFrameView | null> => {
           try {
-            const observed = await observeAX(peer, { scope: "focusedWindow" });
+            // 显式带上遍历预算。不带这三个，对端会退回 `protectiveDefault`——当前两者同值，
+            // 但显式写出来让「生产用的是哪一档」在 Node 侧看得见，而不是藏在对端默认值里；
+            // 跨语言门禁（test/ax.test.ts）钉住这两份常量不漂移。
+            const observed = await observeAX(peer, {
+              scope: "focusedWindow",
+              depth: AX_DEFAULT_DEPTH,
+              nodes: AX_DEFAULT_NODES,
+              ms: AX_DEFAULT_MILLISECONDS,
+            });
             const snap = await snapshotLight();
-            return { frameId: observed.frameId, pid: observed.pid, app: snap.front, offers: observed.offers };
+            // 截断与分页信息原样带下去：模型要靠它知道「还有没展示的目标」，留痕要靠它看出
+            // 这次观察是不是残缺的。此前这一行只留四个字段，把 truncated / nextOffset / elapsedMs
+            // 全丢了，模型因此永远不知道自己手里的目标列表是残缺的。
+            return {
+              frameId: observed.frameId,
+              pid: observed.pid,
+              app: snap.front,
+              offers: observed.offers,
+              truncated: observed.truncated,
+              nextOffset: observed.page.nextOffset,
+            };
           } catch (err) {
             console.error(`[ax] 观察失败，本轮降级为仅脚本动作：${err instanceof Error ? err.message : String(err)}`);
             return null;
           }
         };
         const axOf = (frame: AxFrameView | null): AxExecContext | undefined =>
-          frame ? { peer, frameId: frame.frameId, offers: frame.offers, app: frame.app } : undefined;
+          frame
+            ? {
+                peer,
+                frameId: frame.frameId,
+                offers: frame.offers,
+                app: frame.app,
+                truncated: frame.truncated,
+                nextOffset: frame.nextOffset,
+              }
+            : undefined;
 
         const frame = await observeFrame();
 

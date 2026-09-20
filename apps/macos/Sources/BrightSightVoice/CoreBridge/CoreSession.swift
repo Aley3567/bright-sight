@@ -263,13 +263,19 @@ final class CoreSession: @unchecked Sendable {
     let stdout = Pipe()
     let stderr = Pipe()
     process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-    // `-l` 是为了拿到登录 shell 的 PATH：App 自己的环境里通常没有 node。
+    // `-l` 不是为了 PATH——node 优先用包内自带的那一份。它是为了**环境变量**：App 从 Finder
+    // 启动时不继承 shell 环境，而 TYPESAFE_API_KEY 按约定写在 ~/.zshrc 这类只有登录 shell
+    // 会读的文件里。少了 `-l`，装好的 App 永远拿不到凭证，而且要到第一条指令才暴露。
+    //
+    // node 那一项要么是包内二进制的绝对路径，要么是裸名 `node`（开发机上没有内置那份时的回退）。
+    // 两种都由 zsh 自己解析，我们不在脚本文本里拼路径。
     // 用户原话不再出现在 argv 里——它走 stdin 上的 JSON，脚本文本中没有任何可被拼接的位置
     process.arguments = [
       "-lc",
-      "cd -- \"$1\" && exec node \"$2\" serve",
+      "cd -- \"$1\" && exec \"$2\" \"$3\" serve",
       "bright-sight",
       entry.root.path,
+      entry.node?.path ?? "node",
       entry.script.path,
     ]
     process.standardInput = stdin

@@ -1,5 +1,12 @@
 import { loadSurface, type Surface } from "./actions.ts";
-import { axCapabilityFor, stricterEffect, stricterRisk, type AxActionOffer, type AxOperation } from "./ax.ts";
+import {
+  axCapabilityFor,
+  stricterEffect,
+  stricterRisk,
+  type AxActionOffer,
+  type AxOperation,
+  type AxTruncation,
+} from "./ax.ts";
 import { isAllowedApp } from "./config.ts";
 import { capabilityEffectOf, executableIds, templateOf } from "./scripts.ts";
 import { TASK_ACTIONS, type AxActionSpec, type ScriptActionSpec, type TaskAction } from "./types.ts";
@@ -44,6 +51,16 @@ export type AxFrameView = {
   /** 前台应用名，取自本地快照的 `snapshot.front`。 */
   app: string;
   offers: AxActionOffer[];
+  /**
+   * 这次观察是否被截断（撞到深度 / 节点数 / 时限），以及停在哪。省略 = 走完了整棵树。
+   *
+   * 它和 `nextOffset` 是**两个独立**的「还有没给你看的」信号：这里是「树没走完，可能还有
+   * 目标没被发现」，`nextOffset` 是「走完了，但这一页装不下」。两者都要传到决策层——少了它，
+   * 模型会在一个残缺的集合里硬选一个最像的，然后点错。
+   */
+  truncated?: AxTruncation;
+  /** 分页的下一页 offset。本轮不做翻页动作，只把它带出来，别丢掉。 */
+  nextOffset?: number;
 };
 
 export type OfferSet = {
