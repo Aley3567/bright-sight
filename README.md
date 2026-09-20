@@ -1,8 +1,8 @@
 # bright-sight
 
-bright-sight 是一个 macOS 命令行工具，把一句中文指令变成受控的应用操作，每一步执行完都由代码回读验证。
+bright-sight 把一句中文指令变成受控的应用操作，每一步执行完都由代码回读验证。感知不看屏幕像素，来源是无障碍树和应用脚本字典。
 
-它只能做两件事：在 Chrome 里开标签页、在备忘录里建笔记。真正花力气的部分是保证它只做这两件。
+它现在只能做两件事：在 Chrome 里开标签页、在备忘录里建笔记。真正花力气的部分是保证它只做这两件。入口有两个：命令行 `bright-sight run`，以及菜单栏胶囊（按住右 Command 说话或输入文字）。胶囊走长驻 `bright-sight serve`，不解析 CLI 的中文 stdout。
 
 ```sh
 bright-sight run "搜一下 TypeScript 的 erasableSyntaxOnly，把链接存进备忘录" --execute
@@ -45,15 +45,16 @@ Chrome: 当前 Chrome profile <目录名> 不在允许名单内
 
 - **不能指定 Chrome profile。** Chrome 的脚本字典里没有 profile 这个概念，AppleScript 侧无解。这个工具能做的是执行前探测当前在用哪个 profile，陌生的就停下来问。
 - **动作面能解析出全机所有可脚本化命令，但真正能发出去的只有两条。** 扩展需要写新的脚本模板并通过 `osacompile` 门禁。
-- **输入只有命令行文本。** 语音输入属于 Phase 2，`src/bar/` 目前只有一份说明文档。
+- **命令行 `run` 没有确认入口。** 撞上 Chrome profile 闸或破坏性动作时，它会停在 `waiting_for_confirmation` 并退出。要从原处继续，走胶囊里的确认气泡，或长驻的 `serve` 通道上的 `session.confirm`。
 - **dry-run 只能演练第一步。** 第二步的参数依赖第一步的真实回读，不执行就拿不到。所以 dry-run 不会走到 `done`，它会自己打印一句「dry-run 到此为止是正常的」。
+- **语音条已经是原生 App。** 见 [apps/macos](apps/macos/README.md)。`src/bar/` 只留了一份迁移说明，不再存放实现。
 
 ## 运行要求
 
-- **macOS。** 依赖 Apple Event 与应用脚本字典，没有跨平台计划。
+- **macOS。** 依赖 Apple Event 与应用脚本字典。跨平台仍是未决事项，见 [docs/agent-v2-collaboration-brief.md](docs/agent-v2-collaboration-brief.md)。
 - **Node ≥ 24。** 用原生 TypeScript 类型剥离，没有构建步骤，直接跑 `.ts`。
-- **自动化权限。** 首次执行时系统会弹窗，要求授予终端或你的 IDE 控制 System Events、备忘录与 Chrome 的权限。拒绝的话 `run` 会在轻快照那一步失败。
-- **`TYPESAFE_API_KEY`。** `run` 与 `probe` 要调模型；`surface`、`profile`、`journal` 不需要。
+- **自动化权限。** 首次执行时系统会弹窗，要求授予终端、IDE 或 Bright Sight.app 控制 System Events、备忘录与 Chrome 的权限。拒绝的话 `run` 会在轻快照那一步失败。
+- **`TYPESAFE_API_KEY`。** `run`、`probe` 与胶囊里的自然语言指令要调模型；`surface`、`profile`、`journal` 不需要。
 
 运行时依赖只有 `@typesafe-ai/sdk` 一个包，另有 `typescript` 与 `@types/node` 两个开发依赖。
 
@@ -90,6 +91,7 @@ bright-sight run "搜一下 erasableSyntaxOnly，把链接存进备忘录" --exe
 
 ```sh
 bright-sight run "<一句话>" [--execute] [--engine <名字>]
+bright-sight serve
 bright-sight surface [--all] [--rebuild]
 bright-sight probe ["<一句话>"]
 bright-sight journal [<文件名或路径>]
@@ -99,9 +101,10 @@ bright-sight help
 
 | 命令 | 说明 |
 |---|---|
-| `run` | 走完 observe 到 verify 的闭环。默认 dry-run，`--execute` 才真发 Apple Event。`--engine` 取 `google` / `duckduckgo` / `bing`，默认 `google` |
+| `run` | 走完 observe 到 verify 的闭环。默认 dry-run，`--execute` 才真发 Apple Event。`--engine` 取 `google` / `duckduckgo` / `bing`，默认 `google`。没有确认入口 |
+| `serve` | 长驻 JSON Lines RPC 服务端，给人跑的是胶囊而不是这条命令 |
 | `surface` | 看动作面。`--all` 打印全部动作，`--rebuild` 绕过磁盘缓存重建 |
-| `probe` | 只决策不执行的连通性探针，面向全量动作面 |
+| `probe` | 只决策不执行的连通性探针，走两级 route/pick，面向全量动作面，不走执行白名单 |
 | `journal` | 不带参数列出最近 20 条历史 run；带文件名回放那一次，并提示其中有几条是未脱敏的原文 |
 | `profile` | 不带子命令时打印允许名单与当前在用的 profile；`allow` 加进名单，`forget` 移出。没有 `list` 子命令，列表就是不带子命令那条路径 |
 
@@ -169,8 +172,11 @@ $ bright-sight profile
 
 ## 文档
 
+- [架构](docs/architecture.md)：仓库现在实际长什么样，改代码前先读
 - [设计](docs/design.md)：安全边界怎么划的，四道硬闸、允许清单、verify 的判据来源
-- [架构](docs/architecture.md)：模块职责与数据流，改代码前先读
+- [V2 设计](docs/agent-v2-design.md)：产品形态与尚未落地的结构；规划能力不代表已经实现
+- [V2 进度](docs/agent-v2-progress.md)：已落地、明确没做、未决分叉
+- [macOS 胶囊](apps/macos/README.md)：按住右 Command、确认气泡、长驻核心
 - [贡献](CONTRIBUTING.md)：怎么跑测试、怎么加新动作
 
 ## 许可证

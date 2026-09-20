@@ -6,8 +6,9 @@
 
 ## 进程模型
 
-核心是一个**长驻**的 `bright-sight serve`，两侧走 stdio 上的 JSON Lines 双向 RPC，协议定义在
-`src/protocol.ts`（那是唯一事实来源，Swift 这侧只有它的影子 `Sources/BrightSightVoice/CoreBridge/`）。
+核心是一个**长驻**的 `bright-sight serve`，两侧走 stdio 上的 JSON Lines 双向 RPC。人读契约在
+`src/protocol.ts`；Swift 这侧是它的影子 `Sources/BrightSightVoice/CoreBridge/`，会漂移，对齐靠
+平行测试而不是 codegen。`ax.observe` / `ax.perform` 仍回 `method_not_found`，反向通道骨架就绪、AX 未接线。
 连续几条指令复用同一个 Node 进程；核心崩了下一条指令会把它拉起来，但**不会替你重发上一条**——
 那条指令的副作用发生没有，这一侧看不见，只能由人决定。
 
@@ -69,5 +70,6 @@ write 上不动。
 ## 代码 Seam
 
 - `SpeechTranscribing`：Apple Speech 只是一个 Adapter，云端中文 ASR 将实现同一 Interface。
-- `CommandExecuting`：接收统一文字命令，并返回接受提示和完成提示。
+- `CommandExecuting`：接收统一文字命令，返回 `CommandOutcome`。生产 Adapter 是 `CoreCommandExecutor`（JSON-RPC）；「打开某 App」在它内部走 Native Launcher，不经 Session。
 - `SpeechSpeaking`：播放核心返回的短反馈，UI 不自行推断行动结果。
+- UI 投影的是一次 `session.handle` / `confirm` 的 `SessionUpdate`，不是设计文档里的 `BrightSightEvent` 流。`needs_input` 没有回答入口，目前被呈现为未完成。

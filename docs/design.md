@@ -1,6 +1,6 @@
 # 设计：安全边界
 
-这个项目能做的事只有两件：开标签页、建笔记。这份文档讲的是怎么保证它只做这两件。
+这个项目能做的事只有两件：开标签页、建笔记。这份文档讲的是怎么保证它只做这两件。模块怎么接、入口有几条，看 [architecture.md](architecture.md)；产品形态看 [agent-v2-design.md](agent-v2-design.md)。
 
 读代码之前先读这里。`src/osa.ts`、`src/scripts.ts`、`src/policy.ts` 是安全核心，刻意保持为独立文件，藏进 `execute.ts` 就没有单一可审计对象了。
 

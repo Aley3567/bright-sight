@@ -2,6 +2,8 @@
 
 本文处于决策阶段，只写会影响实现的结构、约束和验收；规划能力不代表已经实现。
 
+仓库里现在实际有的是：冻结脚本白名单上的 observe → judge → policy → act → verify 闭环、长驻 JSON-RPC、Compact 确认气泡。对照见 [`agent-v2-progress.md`](agent-v2-progress.md)。读到「已实现」四个字时，只相信那一段自己划定的范围，不要把整节 Session / Capability / 事件流都当成落地。
+
 ## 1. 产品主线
 
 Bright Sight 接收语音、文字或定时触发，理解目标后操作浏览器和桌面软件。信息不足就追问，动作有风险就确认，界面变化就重新观察，执行后用代码验证。用户纠正过的做法可以沉淀为候选记忆，经检查和确认后复用。
@@ -32,8 +34,13 @@ Compact Mode 是默认入口，服务快速发起和低打扰使用：
 - 承接追问、风险确认、停止和最终结果；
 - 提供“查看详情”与“有问题”入口。
 
-它不保存自己的任务状态，也不根据按钮点击或 CLI 输出推断任务是否成功。显示内容全部来自 Session
+它不保存自己的任务状态，也不根据按钮点击或 CLI 输出推断任务是否成功。显示内容应全部来自 Session
 事件与代码验证结果。
+
+> **落地差：** 当前胶囊投影的是一次 `session.handle` / `confirm` 的 `SessionUpdate`，不是
+> §2.3 的 `BrightSightEvent` 流。追问、查看详情、有问题入口都还没有；`needs_input` 被呈现为
+> 未完成。Native Launcher 打开本机 App 不经 Session。这些与「UI 不拥有业务状态」的张力见
+> progress 未决分叉。
 
 ### 2.2 Workspace Mode
 
@@ -164,7 +171,7 @@ V2 补齐五件事：
 
 ### 5.1 Session Module
 
-CLI、语音条和调度器只调用一个入口：
+目标形状：CLI、语音条和调度器只调用一个入口。
 
 ```ts
 interface AgentSession {
@@ -172,18 +179,27 @@ interface AgentSession {
 }
 ```
 
-Session Module 隐藏目标状态、模型调用、多步循环、追问、确认、取消和持久化。
+Session Module 应隐藏目标状态、模型调用、多步循环、追问、确认、取消和持久化。
 
-**已实现，权威定义在 [`src/protocol.ts`](../src/protocol.ts) 的 `SessionStatus`，本文不复制它。**
-落地时的形状与本文早先草拟的七态不同，差别是有理由的：`handle` 的返回值是**一次调用的结局**，
-不是内部状态机的快照。`idle`、`paused` 从来不会跨出接口；`running` 出现了只能折成 `blocked`
-（`session.ts:214`——一个没收敛的 run 不能被说成做完了）；`waiting_for_clarification` 落地名为
-`needs_input`。内部状态机仍然可以比这四态更细，那是 `loop.ts` 的事，不进协议。
+> **状态：线上结局已落地，Module 本身还没有。** 仓库里没有 `AgentSession` 这个类型。
+> Compact 走的是 `session.handle` / `confirm` / `cancel` 这组 RPC 方法
+> （[`src/session.ts`](../src/session.ts) 的 `makeSessionMethods`）；SDK、journal、profile、
+> execute 和 `resume` 闭包的生产装配在 [`src/cli.ts`](../src/cli.ts) 的 `cmdServe`。
+> `bright-sight run` 直接调 `runLoop`，不经过 Session。权威状态是进程内 `RunState`，
+> 不是本节后面的 `SessionSnapshot`。把生产装配收到哪一层，见 progress 未决分叉。
+
+**已落地的是一次调用的结局类型**，权威定义在 [`src/protocol.ts`](../src/protocol.ts) 的
+`SessionStatus`，本文不复制它。形状与本文早先草拟的七态不同，差别是有理由的：`handle`
+的返回值是**一次调用的结局**，不是内部状态机的快照。`idle`、`paused` 从来不会跨出接口；
+`running` 出现了只能折成 `blocked`（`session.ts:214`——一个没收敛的 run 不能被说成做完了）；
+`waiting_for_clarification` 落地名为 `needs_input`。内部状态机仍然可以比这四态更细，那是
+`loop.ts` 的事，不进协议。
 
 `waiting_for_confirmation` 保存恢复位置（已执行步骤、artifacts、待确认动作与参数），`session.confirm`
 从原处继续，不把整段历史重新解释成一条新命令（`src/loop.ts` 的 `resumeLoop`/`resumeSteps`）。
-`needs_input` 目前**没有**对应的挂起/恢复机制——它只是把状态定住并返回，本文档写作时这条路径
-还没有对称实现，见 [`docs/agent-v2-progress.md`](agent-v2-progress.md) 的未决事项。
+挂起只活在同一 `serverId` 的进程内存里，重启后旧 `confirmId` 全部作废——这是刻意的 fail-closed，
+不是「可恢复会话」的磁盘实现。`needs_input` 目前**没有**对应的挂起/恢复机制——它只是把状态定住
+并返回，见 [`docs/agent-v2-progress.md`](agent-v2-progress.md) 的未决事项。
 
 ### 5.2 Capability Runtime
 

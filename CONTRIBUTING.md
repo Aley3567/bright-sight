@@ -2,7 +2,7 @@
 
 改代码之前先读 [CLAUDE.md](CLAUDE.md)，那里写的是什么能进仓库，尤其是零硬编码与隐私默认值两条。
 
-架构看 [docs/architecture.md](docs/architecture.md)，设计理由看 [docs/design.md](docs/design.md)。
+仓库现在实际长什么样看 [docs/architecture.md](docs/architecture.md)，安全边界看 [docs/design.md](docs/design.md)。产品形态与尚未落地的结构看 [docs/agent-v2-design.md](docs/agent-v2-design.md)，已落地与未决分叉看 [docs/agent-v2-progress.md](docs/agent-v2-progress.md)。
 
 ## 开发
 
