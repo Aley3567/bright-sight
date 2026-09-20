@@ -14,7 +14,7 @@ import {
   type SessionUpdate,
 } from "./protocol.ts";
 import { RpcFailure, type RpcMethodSpec } from "./rpc.ts";
-import { REGISTRY } from "./scripts.ts";
+import { REGISTRY, capabilityEffectOf } from "./scripts.ts";
 import type { OfferSet } from "./surface.ts";
 import { isTaskAction, type RunState } from "./types.ts";
 
@@ -64,8 +64,9 @@ export type SessionRunOutput = {
 
 export type SessionDeps = {
   /**
-   * 取本轮动作面。每次 handle 都重新取，不在启动时缓存成常量：
-   * 阶段 4 之后动作面是**当前界面的函数**，缓存它就等于回到「编译期常量动作面」那个根因。
+   * 取本轮动作面。每次 handle 都重新取，不在启动时缓存成常量。
+   * 今天重取的仍是同一张冻结白名单（REGISTRY ∩ sdef）；阶段 4 之后动作面才是当前界面的函数，
+   * 现在缓存它只是少一次磁盘读，到那时缓存才等于回到「编译期常量动作面」那个根因。
    */
   offers: () => Promise<OfferSet>;
   run: (input: SessionRunInput) => Promise<SessionRunOutput>;
@@ -133,7 +134,7 @@ export function capabilitiesFrom(offers: OfferSet): CapabilityDescriptor[] {
   for (const [id, spec] of offers.specs) {
     const t = REGISTRY[id];
     if (!t) continue;
-    out.push({ id, app: spec.app, summary: spec.summary, effect: t.effect, risk: spec.risk, argv: t.argv });
+    out.push({ id, app: spec.app, summary: spec.summary, effect: capabilityEffectOf(t.effect), risk: spec.risk, argv: t.argv });
   }
   return out;
 }
@@ -141,8 +142,8 @@ export function capabilitiesFrom(offers: OfferSet): CapabilityDescriptor[] {
 /**
  * 结局分类。
  *
- * 全部从 `RunState` 的**结构**推导，不去 match `reasons` 里的中文——那正是
- * `CommandExecutor.swift` 现在的做法，改一句文案就静默失效。
+ * 全部从 `RunState` 的**结构**推导，不去 match `reasons` 里的中文。
+ * 旧的 spawn + `contains("…")` 路径已经不在；Swift 现在按 `reasons[].code` 分支。
  *
  * 「走完步数预算」这一支值得单说：`loop.ts` 的七条返回路径里，只有它会在
  * 「最后一步真的执行了、而且验证通过」的情况下仍然给出 `blocked`。其余 blocked 分支
@@ -157,9 +158,13 @@ function terminalCode(state: RunState): SessionReasonCode {
   if (state.status === "waiting_for_confirmation") return "needs_confirmation";
 
   if (state.status === "needs_input") {
-    // policy 的 ask 与 confirm 都收敛到 needs_input，靠 actionId 分开：
-    // ask 不带动作（actionId 落回模型选的 ASK），confirm 带着待确认的那个动作
-    return last.actionId === "ASK" ? "needs_clarification" : "needs_confirmation";
+    // needs_input 只有两个来源，都是「缺用户信息」，没有一个是「请批准这个动作」：
+    //   1. policy.ask——模型选了 ASK，或置信度低于执行阈值（此时 actionId 是**真实动作**，不是 "ASK"）；
+    //   2. 执行层报 stop（`needs_more_input`）——切片切不出这一步需要的内容。
+    // 从前这里按 `actionId === "ASK"` 分流，于是 1 的低置信度分支与 2 会带着真实 actionId 落进
+    // needs_confirmation（「请批准这个有风险的动作」），而它们根本没有 confirmId 可以批准。
+    // 「要人拍板」是 waiting_for_confirmation 那条（上面已经返回），不是这里。
+    return "needs_clarification";
   }
   if (state.status === "done") return "completed";
 

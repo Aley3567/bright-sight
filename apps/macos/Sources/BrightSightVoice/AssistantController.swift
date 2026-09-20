@@ -65,7 +65,7 @@ final class AssistantController: ObservableObject {
         if !self.pushHeld { self.endVoice() }
       },
       onPartial: { [weak self] text in self?.state.updatePartial(text) },
-      onLevel: { [weak self] level in self?.state.updatePartial(self?.state.transcript ?? "", level: level) },
+      onLevel: { [weak self] level in self?.state.pushLevel(level) },
       onFinal: { [weak self] text in self?.submit(text, source: .voice) },
       onFailure: { [weak self] message in
         self?.pushHeld = false
@@ -240,7 +240,7 @@ final class AssistantController: ObservableObject {
     // 都当成正常结局回过来，把它们折进 failure 就等于告诉用户「出错了」。
     switch outcome.disposition {
     case .completed:
-      state.complete(outcome.visualSummary)
+      state.complete(outcome.visualSummary, steps: outcome.steps)
     case .needsConfirmation:
       guard let confirmation = outcome.confirmation else {
         state.fail("核心要求确认，但没有给出可用的确认标识；这一步没有执行")
@@ -248,7 +248,8 @@ final class AssistantController: ObservableObject {
       }
       state.beginConfirming(confirmation, action: command)
     case .unfinished:
-      state.fail(outcome.visualSummary)
+      // 失败也要把步骤带出来：没做成不等于什么都没发生
+      state.fail(outcome.visualSummary, steps: outcome.steps)
     }
     if voiceFeedbackEnabled, let spoken = outcome.spokenSummary {
       speaker.speak(spoken)

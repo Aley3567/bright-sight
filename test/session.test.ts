@@ -4,7 +4,7 @@ import { capabilitiesFrom, makeSessionMethods, parseCancelParams, parseConfirmPa
 import { RpcFailure } from "../src/rpc.ts";
 import { RESERVED_CLIENT_METHODS, type SessionDescription, type SessionUpdate } from "../src/protocol.ts";
 import type { OfferSet } from "../src/surface.ts";
-import type { ActionSpec, ExecResult, Judgement, PendingConfirmation, RunState, RunStatus, Snapshot, StepRecord, VerifyResult } from "../src/types.ts";
+import type { ActionSpec, ExecResult, Judgement, PendingConfirmation, RunState, RunStatus, ScriptActionSpec, Snapshot, StepRecord, VerifyResult } from "../src/types.ts";
 
 const TAB = "Google Chrome.make-tab";
 const NOTE = "Notes.make-note";
@@ -19,14 +19,15 @@ const SNAP: Snapshot = {
   selection: null,
 };
 
-function specOf(id: string, app: string, risk: ActionSpec["risk"] = "safe"): ActionSpec {
-  return { id, app, summary: `${id} 的一句话说明`, kind: "script", params: [], risk };
+function specOf(id: string, app: string, risk: ActionSpec["risk"] = "safe"): ScriptActionSpec {
+  return { id, app, summary: `${id} 的一句话说明`, kind: "script", params: [], risk, effect: "navigate" };
 }
 
 /** 手搓选项集，零 IO：和 `test/loop.test.ts` 同一套路数。 */
 const OFFERS: OfferSet = {
   offers: [{ id: TAB, summary: "新建标签页" }, { id: NOTE, summary: "新建笔记" }],
   specs: new Map([[TAB, specOf(TAB, "Google Chrome")], [NOTE, specOf(NOTE, "Notes")]]),
+  axSpecs: new Map(),
   ids: [TAB, NOTE, "ASK", "WAIT", "DONE", "BLOCKED", "UNSUPPORTED"],
   total: 751,
 };
@@ -100,24 +101,44 @@ for (const conf of [0.34, 0.58, 0.32, 0.45]) {
   });
 }
 
-test("0.5: needs_input 分得开——追问是追问，确认是确认", () => {
-  const ask = update(state("needs_input", [step({ actionId: "ASK", reasons: ["模型认为信息不足，需要追问"] })]));
-  assert.equal(ask.status, "needs_input");
-  assert.deepEqual(ask.reasons.map((r) => r.code), ["needs_clarification"]);
+// needs_input 全部来自「缺用户信息」，没有一条是「请批准这个动作」——后者是 waiting_for_confirmation。
+// 这一组三条压住同一件事的三面：新分支拦得住、旧分支不受影响、两者不互相冒充。
+test("0.5: needs_input 一律是 needs_clarification——追问、低置信度、执行层缺输入三条同码", () => {
+  const cases: [string, StepRecord][] = [
+    ["模型选了 ASK", step({ actionId: "ASK", reasons: ["模型认为信息不足，需要追问"] })],
+    // 低置信度 ask 带的是**真实 actionId**，不是字面量 ASK。从前这条按 actionId !== "ASK"
+    // 被误报成 needs_confirmation（「请批准这个有风险的动作」），而它根本没有 confirmId 可批
+    ["低置信度 ask 带真实 actionId", step({ actionId: TAB, reasons: ["置信度 0.40 低于 0.75，先问清楚"] })],
+    // 执行层报 stop（needs_more_input）：切片切不出这一步需要的内容。它同样是「缺信息」，
+    // 且 exec.ok 是 false——如果 needs_input 这条判据排到后面，就会被 exec_failed 抢走
+    [
+      "执行层报 stop（缺输入）",
+      step({ actionId: TAB, exec: { ok: false, errors: ["缺少正文来源"], argv: [], ms: 1 }, reasons: ["这一步需要更多信息才能执行，没有发出任何动作"] }),
+    ],
+  ];
+  for (const [name, rec] of cases) {
+    const u = update(state("needs_input", [rec]));
+    assert.equal(u.status, "needs_input", name);
+    assert.deepEqual(u.reasons.map((r) => r.code), ["needs_clarification"], name);
+    assert.equal("confirmId" in u, false, `${name}：没有待批准的动作，就不该带 confirmId`);
+  }
+});
 
-  // profile 闸：动作本身没问题，缺的是人拍板。阶段 3 的确认气泡接的就是这条
+test("0.5: waiting_for_confirmation 仍然是 needs_confirmation——追问那条没有把挂起这条一起吞掉", () => {
+  // 不越界：要人拍板的是这一条（阶段 3 的确认气泡接的就是它），它必须与 needs_clarification 分开。
   const confirm = update(
-    state("needs_input", [step({ actionId: TAB, reasons: ["Chrome profile Default 不在允许名单内，需要当场确认"] })]),
+    state("waiting_for_confirmation", [step({ actionId: TAB, reasons: ["Chrome profile Default 不在允许名单内，需要当场确认"] })]),
   );
+  assert.equal(confirm.status, "waiting_for_confirmation");
   assert.deepEqual(confirm.reasons.map((r) => r.code), ["needs_confirmation"]);
   // detail 原样保留 policy 的话；UI 显示它，但不要拿它做分支
   assert.match(confirm.reasons[0].detail, /不在允许名单内/);
   assert.equal(confirm.capabilities, undefined, "能不能做不是问题，别拿能力清单岔开话题");
 });
 
-test("0.5: 破坏性闸与 profile 闸都落在 needs_confirmation，detail 区分二者", () => {
+test("0.5: 破坏性闸落在挂起确认那条，不是追问那条", () => {
   const destructive = update(
-    state("needs_input", [step({ actionId: NOTE, reasons: ["模型判定破坏性 0.81 超过阈值 0.3"] })]),
+    state("waiting_for_confirmation", [step({ actionId: NOTE, reasons: ["模型判定破坏性 0.81 超过阈值 0.3"] })]),
   );
   assert.deepEqual(destructive.reasons.map((r) => r.code), ["needs_confirmation"]);
   assert.match(destructive.reasons[0].detail, /破坏性/);

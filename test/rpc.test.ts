@@ -121,8 +121,10 @@ test("rpc: 读不出来的行回一条传输层错误，连接不受影响", asy
 
 test("rpc: 未知 method 回 method_not_found，属方法层，连接仍可用", async () => {
   const h = harness({ echo: { handler: (p) => Promise.resolve(p) } });
-  // 阶段 3/4 的方法现在还没有实现，发过来必须如实回这个，而不是断开连接
-  h.peer.ingest('{"id":1,"method":"session.confirm","params":{}}\n');
+  // 空 methods 表上任何名字都是未知 method。用 ax.observe（阶段 4 占位，生产 Swift 也回
+  // method_not_found）和一个根本不存在的名字，不要用已经注册进 serve 的 session.confirm——
+  // 那个测的是「这张表没装它」，不是「产品里它还不存在」。
+  h.peer.ingest('{"id":1,"method":"does.not.exist","params":{}}\n');
   h.peer.ingest('{"id":3,"method":"ax.observe","params":{}}\n');
   await h.peer.drain();
   const fails = h.sent().filter((m) => m.kind === "failure");

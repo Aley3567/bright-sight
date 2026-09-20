@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { probeIdFor, verify, type Probe, type ProbeRunner } from "../src/verify.ts";
 import { SEARCH_ENGINES } from "../src/config.ts";
-import type { ExecResult } from "../src/types.ts";
+import type { AxExecFact, ExecResult } from "../src/types.ts";
 
 const TAB = "Google Chrome.make-tab";
 const SENT = "https://www.google.com/search?q=TypeScript";
@@ -244,4 +244,77 @@ test("verify: 每个可执行动作都有配套的前后对照探针", () => {
   assert.equal(probeIdFor(TAB), "probe.chrome-counts");
   assert.equal(probeIdFor("Notes.make-note"), "probe.notes-count");
   assert.equal(probeIdFor("DONE"), null);
+});
+
+// ── AX 分支与未知动作判负 ─────────────────────────────────────────────────────
+//
+// AX 动作没有 argv、没有脚本回读、没有前后 diff，唯一的证据是 Swift 执行前后复验目标状态
+// 得出的结论。下面逐条钉住四种 status 到 check 的映射，以及「认不出的动作不再默认通过」。
+
+const AX_ID = "01924f4c-0000-7000-8000-000000000abc";
+
+function axExec(status: AxExecFact["status"], verifyOk = status === "executed"): ExecResult {
+  return { ok: true, readback: {}, argv: [], ms: 1, ax: { status, verify: { ok: verifyOk, detail: `Swift 复验：${status}` } } };
+}
+
+test("verify: AX 四条 status 逐条映射到 ax_target_state——只有 executed 且复验通过才算成功", async () => {
+  const cases: Array<{ status: AxExecFact["status"]; expect: boolean }> = [
+    { status: "executed", expect: true },
+    { status: "rejected_stale", expect: false },
+    { status: "failed", expect: false },
+    // effect_unknown 尤其不能判成通过：它的语义是「副作用可能已经发生，禁止自动重试」
+    { status: "effect_unknown", expect: false },
+  ];
+  for (const c of cases) {
+    const r = await verify({ actionId: AX_ID, exec: axExec(c.status), rawArgv: [], pre: null, post: null });
+    assert.deepEqual(r.checks.map((x) => x.name), ["exit_ok", "ax_target_state"], `status=${c.status}`);
+    assert.equal(names(r.checks).ax_target_state, c.expect, `status=${c.status} 的映射`);
+    assert.equal(r.ok, c.expect, `status=${c.status} 的整体结论`);
+  }
+});
+
+test("verify: executed 但 Swift 复验没过同样判负——两半都成立才算成功", async () => {
+  const r = await verify({ actionId: AX_ID, exec: axExec("executed", false), rawArgv: [], pre: null, post: null });
+  assert.equal(names(r.checks).ax_target_state, false);
+  assert.equal(r.ok, false);
+});
+
+test("verify: 未知 actionId 即使执行成功也判负，不再等于默认通过", async () => {
+  const r = await verify({
+    actionId: "SomeApp.do-something",
+    exec: { ok: true, readback: {}, argv: [], ms: 1 },
+    rawArgv: [],
+    pre: null,
+    post: null,
+  });
+  assert.equal(r.ok, false);
+  assert.equal(names(r.checks).unknown_action, false);
+});
+
+test("verify: 已知动作不被未知判据误伤——脚本、AX、任务层动作三条都不产生 unknown_action", async () => {
+  // 脚本：阳性对照，同一份 exec 换成 Notes.make-note 时走的是老判据
+  const note = await verify({
+    actionId: "Notes.make-note",
+    exec: ok({ count: "9", folder: "Notes", account: "iCloud", id: "x" }),
+    rawArgv: ["标题", "正文"],
+    pre: { count: "8" },
+    post: { count: "9" },
+    probe: probes({ "probe.notes-note": { contains: "yes", len: "2", folder: "Notes", account: "iCloud" } }),
+  });
+  assert.equal("unknown_action" in names(note.checks), false, "已知脚本动作不该被判成未知");
+
+  // AX：带 exec.ax 的动作走 AX 分支，也不该被判成未知
+  const ax = await verify({ actionId: AX_ID, exec: axExec("executed"), rawArgv: [], pre: null, post: null });
+  assert.equal("unknown_action" in names(ax.checks), false, "AX 动作由 exec.ax 认领，不该被判成未知");
+
+  // 任务层动作：即使被直接送进 verify（正常路径到不了这里），也不该产生未知判负——
+  // 「不误伤任务层动作」不靠「policy 恰好先分流了」这一个隐含前提
+  const task = await verify({
+    actionId: "ASK",
+    exec: { ok: true, readback: {}, argv: [], ms: 1 },
+    rawArgv: [],
+    pre: null,
+    post: null,
+  });
+  assert.equal("unknown_action" in names(task.checks), false, "任务层动作不是「未知动作」");
 });

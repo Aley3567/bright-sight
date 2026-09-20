@@ -21,23 +21,47 @@ struct CommandConfirmation: Equatable, Sendable {
   let reason: String
 }
 
+/// 一步执行在面板上的展示形态。
+///
+/// 和线上的 `CoreSessionStep` 分开，是因为那边的 `verified` 是三态可空（null =「这一步没执行，
+/// 所以没有可验证的东西」）。把三态留到 UI 去展开，每个渲染点都要重写一遍同样的判断，
+/// 而漏掉 null 分支的后果是把「发出去了但没核对」显示成「完成」——那正是这个项目最不能说的谎。
+struct CommandStep: Equatable, Sendable {
+  enum State: Equatable, Sendable {
+    /// 发出去了，但核心没有给出可核对的回读。不是成功。
+    case unverified
+    case verified
+    case failed
+  }
+
+  /// 来自动作 id 的 `app.command` 前缀，不是写死的中文名——动作面会自己长出新应用。
+  let app: String
+  let command: String
+  let state: State
+}
+
 struct CommandOutcome: Equatable, Sendable {
   let visualSummary: String
   /// nil = 不要念。`replayed` 的结果就走这里：副作用没有再发生一次，播报会让人以为又做了一遍。
   let spokenSummary: String?
   let disposition: CommandDisposition
   let confirmation: CommandConfirmation?
+  /// 真正发出去过的步骤。**失败时尤其要有**：这条指令没做成，但副作用可能已经发生了一半，
+  /// 「已经动过什么」是用户决定要不要重来时唯一的依据。
+  let steps: [CommandStep]
 
   init(
     visualSummary: String,
     spokenSummary: String?,
     disposition: CommandDisposition = .completed,
-    confirmation: CommandConfirmation? = nil
+    confirmation: CommandConfirmation? = nil,
+    steps: [CommandStep] = []
   ) {
     self.visualSummary = visualSummary
     self.spokenSummary = spokenSummary
     self.disposition = disposition
     self.confirmation = confirmation
+    self.steps = steps
   }
 }
 

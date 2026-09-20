@@ -56,6 +56,7 @@ final class CoreSession: @unchecked Sendable {
   private let queue = DispatchQueue(label: "com.brightsight.core-session")
   private let handleTimeout: Duration
   private let forwardsCoreLog: Bool
+  private let inboundMethods: CoreInboundMethodRegistry
 
   private var process: Process?
   private var input: FileHandle?
@@ -76,9 +77,14 @@ final class CoreSession: @unchecked Sendable {
   /// 而晚到的字节会被拌进新进程的行缓冲里——两种都是只在重启前后偶发、事后完全查不出来的故障。
   private var generation = 0
 
-  init(handleTimeout: Duration = CoreSession.defaultHandleTimeout, environment: [String: String] = ProcessInfo.processInfo.environment) {
+  init(
+    handleTimeout: Duration = CoreSession.defaultHandleTimeout,
+    environment: [String: String] = ProcessInfo.processInfo.environment,
+    inboundMethods: CoreInboundMethodRegistry = .accessibility()
+  ) {
     self.handleTimeout = handleTimeout
     self.forwardsCoreLog = environment[CoreSession.logCoreVariable] == "1"
+    self.inboundMethods = inboundMethods
   }
 
   // ── 对外 ────────────────────────────────────────────────────────────────────
@@ -312,6 +318,7 @@ final class CoreSession: @unchecked Sendable {
     serverId = nil
     keysOnCurrentServer.removeAll()
     inboundInFlight.removeAll()
+    inboundMethods.reset()
   }
 
   private func handleExit(generation: Int, status: Int32, reason: Process.TerminationReason) {
@@ -343,6 +350,7 @@ final class CoreSession: @unchecked Sendable {
     reader.reset()
     serverId = nil
     inboundInFlight.removeAll()
+    inboundMethods.reset()
     poisonKeysOnCurrentServer()
 
     for pending in calls.takeAll() {
@@ -386,10 +394,8 @@ final class CoreSession: @unchecked Sendable {
     switch CoreRouter.route(CoreParsedMessage.parse(line), pending: calls.ids, inbound: inboundInFlight) {
     case .settle(let id, let result):
       settle(id: id, result: result)
-    case .dispatch(let id, let method, _):
-      // 阶段 4 的 ax.observe / ax.perform 还没有实现。如实回 method_not_found，**不断开连接**：
-      // 断开的话，对面每加一个方法都会变成一次破坏性变更（兼容规则 1）
-      send(.failure(id: id, error: CoreError(.methodNotFound, "Swift 侧还没有实现 \(method)")))
+    case .dispatch(let id, let method, let params):
+      dispatchInbound(id: id, method: method, params: params)
     case .notify(let method, let params):
       notify(method: method, params: params)
     case .respond(let id, let error):
@@ -398,6 +404,27 @@ final class CoreSession: @unchecked Sendable {
     case .report(let error):
       report(error)
     }
+  }
+
+  private func dispatchInbound(id: Int, method: String, params: JSONValue) {
+    let launched = generation
+    let accepted = inboundMethods.dispatch(method: method, params: params) { [weak self] result in
+      self?.queue.async {
+        guard let self, self.generation == launched else { return }
+        guard self.inboundInFlight.remove(id) != nil else { return }
+        switch result {
+        case .success(let value):
+          self.send(.success(id: id, result: value))
+        case .failure(let error):
+          self.send(.failure(id: id, error: error))
+        }
+      }
+    }
+    guard accepted else {
+      send(.failure(id: id, error: CoreError(.methodNotFound, "Swift 侧不认识 \(method)")))
+      return
+    }
+    inboundInFlight.insert(id)
   }
 
   private func settle(id: Int, result: CoreCallResult) {

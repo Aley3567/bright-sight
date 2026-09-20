@@ -76,6 +76,39 @@ function asRec(v: unknown): Rec | null {
 }
 
 /**
+ * `act` 事件里 `ax` 字段的白名单脱敏。
+ *
+ * 白名单只有两处：`status`（枚举）与 `verify.ok`（布尔）——它们不含用户内容，且是
+ * 「这一步到底走成了没有、为什么没成」的关键。`verify.detail` 与其余一切字段都按内容处理：
+ * detail 可能带元素标签，而没列进白名单的字段默认过度脱敏。这样以后往 `ax` 里加字段，
+ * 忘记来这里补规则时的后果是「信息变少」，不是「原文落盘」。
+ */
+function redactAxFact(v: unknown, salt: string): unknown {
+  const r = asRec(v);
+  if (!r) return deep(v, salt);
+  const out: Rec = {};
+  for (const [k, val] of Object.entries(r)) {
+    if (k === "status") {
+      out[k] = val;
+      continue;
+    }
+    if (k === "verify") {
+      const vr = asRec(val);
+      if (!vr) {
+        out[k] = deep(val, salt);
+        continue;
+      }
+      const vo: Rec = {};
+      for (const [vk, vv] of Object.entries(vr)) vo[vk] = vk === "ok" ? vv : deep(vv, salt);
+      out[k] = vo;
+      continue;
+    }
+    out[k] = deep(val, salt);
+  }
+  return out;
+}
+
+/**
  * 按 phase 分派，而不是无差别递归。
  *
  * 无差别递归会把 `confidence: 0.92`、`ok: true`、`name: "url_origin_match"` 一起抹掉，
@@ -101,7 +134,11 @@ function redactEvent(phase: string, data: unknown, salt: string): unknown {
       // bodySource / violations 是本系统自己生成的 key 与判据文本，保留——
       // 它们正是「模型为什么被拦下」的唯一线索。
       const span = typeof d.span === "string" ? fingerprint(d.span, salt) : d.span;
-      return { ...d, span };
+      // targetId 是 Swift 现铸的 offerId：外部来源、每次观察都变，不是本系统的常量，
+      // 按「白名单之外一律指纹化」处理。抹掉它不影响留痕的用途——
+      // 「模型挑了哪类能力、挑中成没成立」看 action 与 violations 就够。
+      const targetId = typeof d.targetId === "string" ? fingerprint(d.targetId, salt) : d.targetId;
+      return { ...d, span, targetId };
     }
 
     case "act": {
@@ -116,6 +153,10 @@ function redactEvent(phase: string, data: unknown, salt: string): unknown {
         for (const [k, v] of Object.entries(rb)) r[k] = typeof v === "string" ? fingerprint(v, salt) : v;
         out.readback = r;
       }
+      // AX 动作的凭证：status 是枚举、verify.ok 是布尔（结构，是事后归因的关键），
+      // verify.detail 是给人看的一句话、可能带元素标签（内容）。白名单之外一律指纹化——
+      // 以后往 ax 里加字段，默认后果是过度脱敏而不是静默泄露。
+      if (d.ax !== undefined) out.ax = redactAxFact(d.ax, salt);
       return out;
     }
 

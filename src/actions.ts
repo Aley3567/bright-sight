@@ -3,7 +3,8 @@ import { promisify } from "node:util";
 import { createHash } from "node:crypto";
 import { mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import type { ActionParam, ActionSpec } from "./types.ts";
+import { capabilityEffectOf, type ScriptEffect } from "./scripts.ts";
+import type { ActionParam, Risk, ScriptActionSpec } from "./types.ts";
 
 // sdef 不是 osascript：它只读磁盘上的脚本字典，不投递 Apple Event，
 // 也不接受任何用户输入（参数恒为 readdir 扫出的 .app 路径），
@@ -30,11 +31,32 @@ const COCOA_STANDARD = "/System/Library/ScriptingDefinitions/CocoaStandard.sdef"
 const DESTRUCTIVE = new Set(["delete", "remove", "empty", "erase", "trash"]);
 const CAUTION = new Set(["move", "save", "print", "duplicate", "set", "close", "quit"]);
 
-function riskOf(command: string): ActionSpec["risk"] {
+function riskOf(command: string): Risk {
   const c = command.toLowerCase();
   if (DESTRUCTIVE.has(c)) return "destructive";
   if (CAUTION.has(c)) return "caution";
   return "safe";
+}
+
+/** 「造出一个东西」的动词。落在 `make` 上的命令最多，它是 sdef 里唯一的通用造物入口。 */
+const CREATES = new Set(["make", "create", "new"]);
+/** 「把人带到某个地方」的动词：打开某个位置/页面属于导航，不是改动。 */
+const NAVIGATES = new Set(["open", "show", "go", "launch", "activate"]);
+
+/**
+ * sdef 动词给出的**初判**副作用档。
+ *
+ * 它只是初判：`make` 这一个动词既推不出「开标签页是 navigate」也推不出「记笔记是 draft」，
+ * 真正可执行的动作（在冻结注册表里的）由 `surface.ts` 用模板的 effect 覆盖成权威值。
+ * 这里存在的意义是让动作面里那些**不可执行**的条目也有一个诚实的字段，
+ * 而不是编一个看起来像真的值。它不参与任何安全判据——能不能执行由注册表说了算。
+ */
+function scriptEffectOf(command: string): ScriptEffect {
+  const c = command.toLowerCase();
+  if (DESTRUCTIVE.has(c)) return "destroy";
+  if (CREATES.has(c)) return "create";
+  if (NAVIGATES.has(c)) return "navigate";
+  return "read";
 }
 
 /**
@@ -44,8 +66,8 @@ function riskOf(command: string): ActionSpec["risk"] {
  * 无 CDATA），正则足够且让本模块保持零依赖，与仓库其余部分一致。
  * 代价是格式一旦变化会静默少抽命令，因此 extractApp 对空结果会显式报告。
  */
-function parseCommands(xml: string, app: string): ActionSpec[] {
-  const out: ActionSpec[] = [];
+function parseCommands(xml: string, app: string): ScriptActionSpec[] {
+  const out: ScriptActionSpec[] = [];
   // 命令块：<command name="..." ...> ... </command>，或自闭合的 <command ... />
   const blocks = xml.matchAll(/<command\s+([^>]*?)(?:\/>|>([\s\S]*?)<\/command>)/g);
   for (const m of blocks) {
@@ -83,6 +105,7 @@ function parseCommands(xml: string, app: string): ActionSpec[] {
       kind: "script",
       params,
       risk: riskOf(name),
+      effect: capabilityEffectOf(scriptEffectOf(name)),
     });
   }
   return out;
@@ -148,11 +171,11 @@ function unescapeXml(s: string): string {
  * 只展开 make，不做全量 command × class：Chrome 5 个 class × 20+ 命令是 100+ 条，
  * 全系统会撞穿 Choice 的 255 上限，而且 `Chrome.reload-bookmark-folder` 这种组合根本不存在。
  */
-function expandMake(specs: ActionSpec[], classes: ClassDef[], app: string): ActionSpec[] {
+function expandMake(specs: ScriptActionSpec[], classes: ClassDef[], app: string): ScriptActionSpec[] {
   const generic = specs.find((s) => s.id === `${app}.make`);
   if (!generic) return specs;
 
-  const expanded: ActionSpec[] = [];
+  const expanded: ScriptActionSpec[] = [];
   for (const c of classes) {
     if (c.writable.length === 0) continue; // 没有可填的属性，建出来也是个空壳
     const desc = unescapeXml(c.description) || `${app} 的 ${c.name}`;
@@ -163,6 +186,7 @@ function expandMake(specs: ActionSpec[], classes: ClassDef[], app: string): Acti
       kind: "script",
       params: c.writable,
       risk: generic.risk,
+      effect: generic.effect,
     });
   }
   if (expanded.length === 0) return specs;
@@ -176,7 +200,7 @@ function expandMake(specs: ActionSpec[], classes: ClassDef[], app: string): Acti
  * 与 extractApp 分开是为了可测：测试拿提交进仓库的 sdef 快照跑这里，
  * 断言就不会随本机应用版本漂移；extractApp 只负责把原文取出来。
  */
-export function parseSdef(own: string, app: string, standard?: string): ActionSpec[] {
+export function parseSdef(own: string, app: string, standard?: string): ScriptActionSpec[] {
   if (!own.trim()) return [];
   const specs = parseCommands(own, app);
   // 继承标准套件：sdef 只留下 xi:include 指令，需要我们自己展开
@@ -184,7 +208,7 @@ export function parseSdef(own: string, app: string, standard?: string): ActionSp
     specs.push(...parseCommands(standard, app));
   }
   // 同名命令去重：应用自有定义覆盖标准套件的同名项
-  const seen = new Map<string, ActionSpec>();
+  const seen = new Map<string, ScriptActionSpec>();
   for (const s of specs) if (!seen.has(s.id)) seen.set(s.id, s);
   // class 只从应用自有 sdef 抽：标准套件里的 application / window 是通用外壳，
   // 展开出来的 make-application 之类对任何意图都没有区分度
@@ -192,7 +216,7 @@ export function parseSdef(own: string, app: string, standard?: string): ActionSp
 }
 
 /** 读取一个应用的完整动作面：标准套件 + 应用自有套件。 */
-export async function extractApp(appPath: string): Promise<ActionSpec[]> {
+export async function extractApp(appPath: string): Promise<ScriptActionSpec[]> {
   const app = appPath.split("/").pop()!.replace(/\.app$/, "");
   let own = "";
   try {
@@ -210,7 +234,7 @@ export async function extractApp(appPath: string): Promise<ActionSpec[]> {
   return parseSdef(own, app, standard);
 }
 
-export type Surface = { actions: ActionSpec[]; apps: string[]; scriptable: string[] };
+export type Surface = { actions: ScriptActionSpec[]; apps: string[]; scriptable: string[] };
 
 const DEFAULT_DIRS = ["/Applications", "/System/Applications"];
 
@@ -247,10 +271,10 @@ async function buildFrom(paths: readonly string[]): Promise<Surface> {
  * 一次 run 里 observe→judge→act→verify 会走多轮，每轮重建动作面是灾难，
  * 所以按「应用清单 + 各自 mtime」做指纹：应用没装没删没更新，就直接复用上次的解析结果。
  *
- * 缓存存的是解析后的 ActionSpec 而非 sdef 原文，所以解析规则一改缓存就必须失效——
+ * 缓存存的是解析后的 ScriptActionSpec 而非 sdef 原文，所以解析规则一改缓存就必须失效——
  * 这件事没有自动机制，靠 CACHE_VERSION 手动递增。改了 parseCommands / riskOf 就要 +1。
  */
-const CACHE_VERSION = 2;
+const CACHE_VERSION = 3;
 
 /** 缓存目录可注入：测试指向临时目录，不污染也不依赖真实 ~/.bright-sight。 */
 export function defaultCacheDir(): string {

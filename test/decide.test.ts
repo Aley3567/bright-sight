@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { TypeSafeClient } from "@typesafe-ai/sdk";
-import { judge, JevBackend, type JudgeInput } from "../src/decide.ts";
+import { readFile } from "node:fs/promises";
+import { judge, JevBackend, JEV_MODEL, type JudgeInput } from "../src/decide.ts";
 import { policy } from "../src/policy.ts";
 import { REGISTRY } from "../src/scripts.ts";
 import { ALLOWED_APPS } from "../src/config.ts";
@@ -36,7 +37,8 @@ function choiceAnswer(choice: string, probabilities?: Record<string, number>) {
  * 完整的 Response/Headers——为了不把测试绑死在 SDK 内部结构上，这里只造一个
  * 带 `status` 的裸 Error。decide.ts 的重试判定只看 `err.status`，鸭子类型足够。
  */
-type ScriptStep = { status: number } | { answers: Record<string, unknown> } | "hang";
+// `model` 是对面回给我们的版本号。带上它才能测出「留痕记的是响应里的那个、不是我们请求的那个」。
+type ScriptStep = { status: number } | { answers: Record<string, unknown>; model?: string } | "hang";
 type CallOpts = { signal?: AbortSignal; timeout?: number; retry?: { maxRetries?: number } };
 type CallWithOpts = Call & { opts?: CallOpts };
 
@@ -79,16 +81,19 @@ const SNAP: Snapshot = {
   selection: null,
 };
 
+/** 脚本动作 + 任务层动作，不含 AX。默认用它把绝大多数用例收窄到与 AX 无关。 */
+const BASE_OFFERS = [
+  { id: TAB, summary: "新建标签页" },
+  { id: NOTE, summary: "新建笔记" },
+  { id: "ASK", summary: "追问" },
+  { id: "DONE", summary: "做完了" },
+];
+
 function input(over: Partial<JudgeInput> = {}): JudgeInput {
   return {
     utterance: UTTERANCE,
     snapshot: SNAP,
-    offers: [
-      { id: TAB, summary: "新建标签页" },
-      { id: NOTE, summary: "新建笔记" },
-      { id: "ASK", summary: "追问" },
-      { id: "DONE", summary: "做完了" },
-    ],
+    offers: BASE_OFFERS,
     spans: ["TypeScript 的 erasableSyntaxOnly", "TypeScript 的 erasableSyntaxOnly，把链接"],
     bodySources: [],
     history: [],
@@ -180,7 +185,7 @@ test("decide: 概率和明显不是 1 时记为违规", async () => {
 test("decide: 模型完全没返回 action 时，破坏性按最保守取值", async () => {
   const d = await judge(fakeClient({}), input());
   assert.equal(d.judgement.destructive, 1, "缺失的安全信号不能默认成安全");
-  const spec: ActionSpec = { id: TAB, app: "Google Chrome", summary: "", kind: "script", params: [], risk: "safe" };
+  const spec: ActionSpec = { id: TAB, app: "Google Chrome", summary: "", kind: "script", params: [], risk: "safe", effect: "navigate" };
   const g = policy({ judgement: d.judgement, offered: [TAB, "none"], spec, template: REGISTRY[TAB] });
   assert.notEqual(g.kind, "execute");
 });
@@ -290,7 +295,7 @@ test("decide: JevBackend.pick 传给 systemOne 的 options 关掉了 SDK 自带�
     calls,
   );
   const backend = new JevBackend(client);
-  const spec: ActionSpec = { id: TAB, app: "Google Chrome", summary: "新建标签页", kind: "script", params: [], risk: "safe" };
+  const spec: ActionSpec = { id: TAB, app: "Google Chrome", summary: "新建标签页", kind: "script", params: [], risk: "safe", effect: "navigate" };
   await backend.pick({ utterance: UTTERANCE, snapshot: SNAP, actions: [spec] });
   assert.equal(calls[0].opts?.retry?.maxRetries, 0);
 });
@@ -350,7 +355,203 @@ test("decide: 键与选项集合一致、选中项确是众数——合法输入
     input({ spans: [SPAN1] }),
   );
   assert.deepEqual(d.violations, [], "键对得上、选中项也是众数，不该被新判据误伤");
-  const spec: ActionSpec = { id: NOTE, app: "Notes", summary: "新建笔记", kind: "script", params: [], risk: "safe" };
+  const spec: ActionSpec = { id: NOTE, app: "Notes", summary: "新建笔记", kind: "script", params: [], risk: "safe", effect: "draft" };
   const g = policy({ judgement: d.judgement, offered: [TAB, NOTE, "ASK", "DONE"], spec, template: REGISTRY[NOTE] });
   assert.equal(g.kind, "execute", "不该把没问题的答案也拦下来");
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 5.4：两级 head——一个 operation head + 每种 operation 一个 target head
+ *
+ * AX 的 offerId 每次 observe 都变。放进 action head 会让单题上下文随目标数量膨胀，
+ * 也让概率键集每次都不一样。折叠成「每种 operation 一个代表项」之后，能力与目标分成两问。
+ * ────────────────────────────────────────────────────────────────────────── */
+
+const AX_CLICK_A = "01924f4c-0000-7000-8000-000000000001";
+const AX_CLICK_B = "01924f4c-0000-7000-8000-000000000002";
+const AX_OPEN_A = "01924f4c-0000-7000-8000-000000000003";
+
+type AxOffer = { id: string; summary: string; operation: "CLICK" | "OPEN" | "TYPE_TEXT" | "SELECT" };
+
+/** 两个 CLICK（要问那一问）、一个 OPEN（单候选，不问）。 */
+const AX_CLICKS: AxOffer[] = [
+  { id: AX_CLICK_A, summary: "AX CLICK：继续", operation: "CLICK" },
+  { id: AX_CLICK_B, summary: "AX CLICK：取消", operation: "CLICK" },
+];
+const AX_OPEN: AxOffer[] = [{ id: AX_OPEN_A, summary: "AX OPEN：备忘录", operation: "OPEN" }];
+
+function axInput(extra: AxOffer[]): JudgeInput {
+  // 只用单候选片段，收窄掉 span head，让这组用例只盯 action / target 两级
+  return input({ offers: [...BASE_OFFERS, ...extra], spans: [SPAN1] });
+}
+
+function criteriaOf(q: unknown): Record<string, unknown> {
+  const c = (q as { criteria?: Record<string, unknown> }).criteria;
+  assert.ok(c && Object.keys(c).length > 0, "选项集为空，结构变了就该红而不是空转通过");
+  return c;
+}
+
+/** axInput 下 action head 的全部键；checkDistribution 要求概率键集与它完全相等。 */
+const ACTION_KEYS = [TAB, NOTE, "ASK", "DONE", "AX:CLICK", "AX:OPEN"];
+
+/** 让 selected 成为众数的完整分布——不给全会被键集相等那条拦下，混进要测的变量里。 */
+function majority(selected: string): Record<string, number> {
+  const p: Record<string, number> = {};
+  for (const k of ACTION_KEYS) p[k] = 0.05;
+  p[selected] = 1 - (ACTION_KEYS.length - 1) * 0.05;
+  return p;
+}
+
+test("decide: AX offers 折叠成每种 operation 一个代表项，具体目标落到 target head", async () => {
+  const calls: Call[] = [];
+  await judge(
+    fakeClient(
+      {
+        action: choiceAnswer("AX:CLICK", majority("AX:CLICK")),
+        target_CLICK: choiceAnswer(AX_CLICK_A, { [AX_CLICK_A]: 0.7, [AX_CLICK_B]: 0.3 }),
+      },
+      calls,
+    ),
+    axInput([...AX_CLICKS, ...AX_OPEN]),
+  );
+  const actionKeys = Object.keys(criteriaOf(calls[0].questions.action));
+  assert.ok(actionKeys.includes("AX:CLICK"), `action head 缺 CLICK 代表项：${JSON.stringify(actionKeys)}`);
+  assert.ok(actionKeys.includes("AX:OPEN"), "action head 缺 OPEN 代表项");
+  assert.ok(!actionKeys.includes(AX_CLICK_A), "具体 offerId 不进 action head");
+  assert.ok(!actionKeys.includes(AX_CLICK_B), "具体 offerId 不进 action head");
+  // target head 的键是那个 operation 下的 offerId
+  assert.deepEqual(Object.keys(criteriaOf(calls[0].questions.target_CLICK)), [AX_CLICK_A, AX_CLICK_B]);
+});
+
+test("decide: 在被选中的 target head 里编 id，判为违规且不流向执行层", async () => {
+  const d = await judge(
+    fakeClient({ action: choiceAnswer("AX:CLICK", majority("AX:CLICK")), target_CLICK: choiceAnswer("编造的目标 id") }),
+    axInput([...AX_CLICKS, ...AX_OPEN]),
+  );
+  assert.deepEqual(
+    d.violations,
+    [`模型返回了未提供的目标 ${JSON.stringify("编造的目标 id")}`],
+    "只该报编目标这一条，别的 head 不许牵连",
+  );
+  assert.equal(d.targetId, null, "没通过校验的目标不许流到执行层");
+});
+
+test("decide: 在未被选中的 target head 里编 id，不算违规", async () => {
+  const d = await judge(
+    fakeClient({
+      action: choiceAnswer("AX:CLICK", majority("AX:CLICK")),
+      target_CLICK: choiceAnswer(AX_CLICK_A, { [AX_CLICK_A]: 0.7, [AX_CLICK_B]: 0.3 }),
+      // 这一问压根没被要求（OPEN 单候选），模型顺手编一个不该牵连整条判断
+      target_OPEN: choiceAnswer("编造的目标 id"),
+    }),
+    axInput([...AX_CLICKS, ...AX_OPEN]),
+  );
+  assert.deepEqual(d.violations, [], "没被选中的 head 与这次执行无关");
+  assert.equal(d.targetId, AX_CLICK_A);
+});
+
+test("decide: 选中的不是 AX 动作时，任何 target head 都不参与校验", async () => {
+  const d = await judge(
+    fakeClient({ action: choiceAnswer(TAB, majority(TAB)), target_CLICK: choiceAnswer("编造的目标 id") }),
+    axInput([...AX_CLICKS, ...AX_OPEN]),
+  );
+  assert.deepEqual(d.violations, [], "选了脚本动作，target head 就不该被校验");
+  assert.equal(d.targetId, null);
+});
+
+test("decide: 某个 operation 只有一个 offer 时，那一问不被发出，代码直接采用", async () => {
+  const calls: Call[] = [];
+  const d = await judge(
+    fakeClient(
+      // 同时给一个乱写的 target_OPEN：代码直接采用唯一目标，优先于模型乱写
+      {
+        action: choiceAnswer("AX:OPEN", majority("AX:OPEN")),
+        target_OPEN: choiceAnswer("编造的目标 id"),
+        target_CLICK: choiceAnswer(AX_CLICK_A, { [AX_CLICK_A]: 0.7, [AX_CLICK_B]: 0.3 }),
+      },
+      calls,
+    ),
+    axInput([...AX_CLICKS, ...AX_OPEN]),
+  );
+  assert.ok(!("target_OPEN" in calls[0].questions), "单候选的 head 少问一题");
+  assert.ok("target_CLICK" in calls[0].questions, "多候选的 head 仍要问");
+  assert.equal(d.targetId, AX_OPEN_A, "唯一的目标直接采用");
+  assert.deepEqual(d.violations, [], "代码直接采用优先于模型乱写的那一问");
+});
+
+test("decide: 被选中的 target head 也要满足概率键集与候选集相等，不放宽成超集", async () => {
+  const d = await judge(
+    fakeClient({
+      action: choiceAnswer("AX:CLICK", majority("AX:CLICK")),
+      // AX_CLICK_A / AX_CLICK_B 之外多编一个键
+      target_CLICK: choiceAnswer(AX_CLICK_A, { [AX_CLICK_A]: 0.7, [AX_CLICK_B]: 0.2, 编造的键: 0.1 }),
+    }),
+    axInput([...AX_CLICKS, ...AX_OPEN]),
+  );
+  assert.ok(
+    d.violations.some((v) => v.includes("target_CLICK 的概率分布键与选项集合不符") && v.includes("多出")),
+    `实际违规: ${JSON.stringify(d.violations)}`,
+  );
+});
+
+test("decide: 没有 AX offer 时 head 结构与改造前一致——不走两级", async () => {
+  const calls: Call[] = [];
+  await judge(fakeClient({ action: choiceAnswer(TAB), span: choiceAnswer(SPAN1) }, calls), input());
+  const keys = Object.keys(calls[0].questions).sort();
+  assert.deepEqual(keys, ["action", "complete", "destructive", "span"], `实际 head: ${JSON.stringify(keys)}`);
+  const actionKeys = Object.keys(criteriaOf(calls[0].questions.action));
+  assert.ok(!actionKeys.some((k) => k.startsWith("AX:")), "没有 AX offer 就不该冒出 AX 代表项");
+});
+
+
+// ── 模型版本钉死 ──────────────────────────────────────────────────────────────
+//
+// SDK 不传 model 时落到 `jev-latest`，那是个会往前滚的别名。漂移的后果不是报错而是行为变化：
+// 同一句话、同一个动作面，某天开始选另一个目标，留痕里看不出任何异常。
+
+test("decide: 每次问模型都带上钉死的版本，不落到会漂移的 jev-latest 别名", async () => {
+  const calls: CallWithOpts[] = [];
+  const client = scriptedClient(
+    [
+      { answers: { app: choiceAnswer("Google Chrome"), complete: { noul: 1 }, destructive: { noul: 0 } } },
+      { answers: { action: choiceAnswer(TAB), destructive: { noul: 0 } } },
+    ],
+    calls,
+  );
+  const backend = new JevBackend(client);
+  const spec: ActionSpec = { id: TAB, app: "Google Chrome", summary: "新建标签页", kind: "script", params: [], risk: "safe", effect: "navigate" };
+
+  await backend.route({ utterance: UTTERANCE, snapshot: SNAP, candidates: ["Google Chrome", "Notes"] });
+  await backend.pick({ utterance: UTTERANCE, snapshot: SNAP, actions: [spec] });
+
+  assert.equal(calls.length, 2);
+  for (const call of calls) {
+    assert.equal((call as { model?: string }).model, JEV_MODEL, "每个调用点都要带 model");
+  }
+});
+
+test("decide: 留痕里的 backend 记的是对面实际用的版本，不是我们请求的那个", async () => {
+  const client = scriptedClient([
+    { model: "jev-1.14.0", answers: { app: choiceAnswer("Google Chrome"), complete: { noul: 1 }, destructive: { noul: 0 } } },
+  ]);
+  const judgement = await new JevBackend(client).route({
+    utterance: UTTERANCE,
+    snapshot: SNAP,
+    candidates: ["Google Chrome", "Notes"],
+  });
+
+  // pin 了不等于对面一定照办。两个值不一致时，backend 是唯一能看出来的地方——
+  // 所以这里刻意让假客户端回一个**与请求不同**的版本号。
+  assert.equal(judgement.backend, "jev/jev-1.14.0");
+});
+
+test("decide: 源码里每个 systemOne 调用点都 pin 了版本——新加一个忘了 pin 会在这里红", async () => {
+  // 上面那条只覆盖 JevBackend 的两个方法，`judge()` 里还有第三个调用点，
+  // 而且以后随时可能出现第四个。数调用点是唯一能挡住「新加的那个忘了」的办法。
+  const source = await readFile(new URL("../src/decide.ts", import.meta.url), "utf8");
+  const callSites = source.match(/\.systemOne\(/g)?.length ?? 0;
+  const pinned = source.match(/model: JEV_MODEL/g)?.length ?? 0;
+
+  assert.ok(callSites >= 3, `至少该有 3 个调用点，实际 ${callSites}——正则失效了`);
+  assert.equal(pinned, callSites, `${callSites} 个 systemOne 调用点里只有 ${pinned} 个 pin 了版本`);
 });

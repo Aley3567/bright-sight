@@ -1,10 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { resumeLoop, runLoop, type LoopDeps, type LoopOptions } from "../src/loop.ts";
+import { runAction } from "../src/capability.ts";
+import { SEARCH_ENGINES } from "../src/config.ts";
+import { SPAN_SOURCE } from "../src/execute.ts";
+import type { AxActionOffer, AxActionStatus, AxPeer } from "../src/ax.ts";
 import type { Decision } from "../src/decide.ts";
-import type { OfferSet } from "../src/surface.ts";
+import type { AxFrameView, OfferSet } from "../src/surface.ts";
 import type { ExecOutcome } from "../src/execute.ts";
-import type { ActionSpec, Judgement, ProfileGate, Snapshot, VerifyResult } from "../src/types.ts";
+import type { AxActionSpec, Judgement, ProfileGate, ScriptActionSpec, Snapshot, VerifyResult } from "../src/types.ts";
 
 const TAB = "Google Chrome.make-tab";
 const NOTE = "Notes.make-note";
@@ -19,8 +23,8 @@ const SNAP: Snapshot = {
   selection: null,
 };
 
-function specOf(id: string, app: string): ActionSpec {
-  return { id, app, summary: id, kind: "script", params: [], risk: "safe" };
+function specOf(id: string, app: string): ScriptActionSpec {
+  return { id, app, summary: id, kind: "script", params: [], risk: "safe", effect: "navigate" };
 }
 
 /** 假的选项集：手搓而不是走 loadOffers，这套测试零 IO 零网络。 */
@@ -34,6 +38,7 @@ const OFFERS: OfferSet = {
     [TAB, specOf(TAB, "Google Chrome")],
     [NOTE, specOf(NOTE, "Notes")],
   ]),
+  axSpecs: new Map(),
   ids: [TAB, NOTE, "ASK", "WAIT", "DONE", "BLOCKED", "UNSUPPORTED"],
   total: 751,
 };
@@ -52,7 +57,7 @@ function judgement(action: string, over: Partial<Judgement> = {}): Judgement {
 }
 
 function decision(action: string, over: Partial<Decision> = {}): Decision {
-  return { judgement: judgement(action), span: "TypeScript", bodySource: null, violations: [], ...over };
+  return { judgement: judgement(action), span: "TypeScript", bodySource: null, targetId: null, violations: [], ...over };
 }
 
 function outcome(over: Partial<ExecOutcome["result"]> = {}, artifacts: ExecOutcome["artifacts"] = []): ExecOutcome {
@@ -525,4 +530,393 @@ test("挂起: 留痕里有 suspend / resume，且一次都不会缺 run.end", as
   // 先看清楚世界，才谈得上判定陈旧与否
   assert.deepEqual(events.map((e) => e[0]), ["observe", "resume", "act", "verify", "observe", "judge", "run.end"]);
   assert.deepEqual(events.filter((e) => e[0] === "suspend"), []);
+});
+
+// ── stop 收手与 ASK 分流：两条都不该被当成失败的执行 ───────────────────────────
+
+test("loop: 执行层报 stop 时置 needs_input 收手，不消耗恢复预算也不跑 verify", async () => {
+  const d = deps({
+    script: [decision(TAB)],
+    act: () =>
+      Promise.resolve({
+        result: { ok: false, errors: ["缺少正文来源"], argv: [], ms: 1 },
+        artifacts: [],
+        rawArgv: [],
+        stop: "needs_more_input",
+      }),
+  });
+  const state = await run("搜一下 TypeScript 存进备忘录", d);
+  assert.equal(state.status, "needs_input");
+  assert.equal(state.steps.length, 1);
+  assert.equal(state.steps[0].verify, null, "缺输入没有可验证的东西，不该跑 verify");
+  // stop 不是失败：不该出现「重新观察改走其他路径」这类恢复预算的提示
+  assert.equal(state.steps[0].reasons.join("").includes("恢复"), false);
+});
+
+test("loop: 模型选 ASK 时不进入执行与验证——未知动作判负不该误伤任务层动作", async () => {
+  let verified = 0;
+  const d = deps({
+    script: [decision("ASK")],
+    checkStep: () => {
+      verified++;
+      return Promise.resolve(GREEN);
+    },
+  });
+  const state = await run("信息不够，你再说清楚点", d);
+  assert.equal(state.status, "needs_input");
+  assert.equal(verified, 0, "追问不产生任何执行，也就不该进入 verify");
+  const checks = state.steps.flatMap((s) => s.verify?.checks ?? []);
+  assert.equal(checks.some((c) => c.name === "unknown_action"), false, "任务层动作不该出现 unknown_action 判负");
+});
+
+// ── AX 动作的重复守卫与恢复重认领（阶段 5.5） ───────────────────────────────
+//
+// 这一组用**真的 runAction + 真的 AX 适配器**，只把 AX peer 换成假的：判据之一是
+// 「ax.perform 零调用」，只有让调用真的走到 performAX，那个 0 才有意义。假 peer 是
+// `test/capability.test.ts` 的 peerCalling 的加强版——它记下每次反向调用的方法名与参数。
+
+const AX_APP = "Finder";
+
+/** 一个 AX offer。OPEN 只认 AXLink（effect navigate → policy 放行），CLICK 走兜底（change → 挂起确认）。 */
+function axOffer(id: string, operation: AxActionOffer["operation"], label: string, role = "AXButton"): AxActionOffer {
+  const link = role === "AXLink";
+  return {
+    id,
+    operation,
+    target: { ref: "opaque", role, label, state: { enabled: true, editable: false } },
+    // effect/risk 与 `AXOfferFactory` 对这两个 role 的取值一致，只为让 policy 走到该走的分支
+    effect: link ? "navigate" : "change",
+    risk: link ? "safe" : "caution",
+  };
+}
+
+function axFrame(frameId: string, offers: AxActionOffer[]): AxFrameView {
+  return { frameId, pid: 42, app: AX_APP, offers };
+}
+
+/** 只有 AX 半边的选项集：脚本那半与 AX 的守卫/重认领无关，不掺进来。 */
+function axOfferSet(frameId: string, offers: AxActionOffer[]): OfferSet {
+  const axSpecs = new Map<string, AxActionSpec>(
+    offers.map((o) => [
+      o.id,
+      {
+        kind: "ax",
+        id: o.id,
+        app: AX_APP,
+        summary: `AX ${o.operation}`,
+        params: [],
+        risk: o.risk,
+        effect: o.effect,
+        frameId,
+        operation: o.operation,
+      } as AxActionSpec,
+    ]),
+  );
+  return {
+    offers: offers.map((o) => ({ id: o.id, summary: `AX ${o.operation}`, operation: o.operation })),
+    specs: new Map(),
+    axSpecs,
+    ids: [...offers.map((o) => o.id), "ASK", "WAIT", "DONE", "BLOCKED", "UNSUPPORTED"],
+    total: 0,
+  };
+}
+
+type Seen = Array<{ method: string; params: unknown }>;
+
+function axPeer(seen: Seen): AxPeer {
+  return {
+    call: async <T>(method: string, params?: unknown): Promise<T> => {
+      seen.push({ method, params });
+      return { status: "executed", artifacts: [], verify: { ok: true, detail: "ok" } } as T;
+    },
+  };
+}
+
+function performs(seen: Seen): Seen {
+  return seen.filter((s) => s.method === "ax.perform");
+}
+
+function axOpt(frame: AxFrameView, peer: AxPeer): LoopOptions {
+  return { ax: { peer, frameId: frame.frameId, offers: frame.offers, app: frame.app } };
+}
+
+/** act 走真的 runAction，于是 AX 动作真的经过适配器与 performAX。 */
+function axDeps(script: Decision[] = []): LoopDeps {
+  let i = 0;
+  return {
+    observe: () => Promise.resolve(SNAP),
+    decide: () => Promise.resolve(script[i++] ?? decision("DONE")),
+    act: (id, ctx, step) => runAction(id, { ...ctx, engine: SEARCH_ENGINES.google }, { step }),
+    probe: () => Promise.resolve(null),
+    checkStep: () => Promise.resolve(GREEN),
+  };
+}
+
+test("5.5: 两级 head 的答案被合成一个动作 id——选了 AX 代表项也能真的执行", async () => {
+  // judge 给的是 action="AX:OPEN" + targetId=<offerId> 两半。执行层只认一个 id，
+  // 少了这一步合成，AX:OPEN 不在动作面里，会被 policy 当成「未提供的选项」整条拦掉。
+  const seen: Seen = [];
+  const open = axOffer("open-1", "OPEN", "打开", "AXLink");
+  const d = axDeps([decision("AX:OPEN", { targetId: open.id }), decision("DONE")]);
+
+  const state = await runLoop("打开那个链接", axOfferSet("frame-1", [open]), d, axOpt(axFrame("frame-1", [open]), axPeer(seen)));
+
+  assert.equal(state.status, "done");
+  assert.deepEqual(
+    performs(seen).map((p) => (p.params as { offerId: string }).offerId),
+    ["open-1"],
+    "执行的是 targetId 指的那个 offer，不是代表项字符串",
+  );
+});
+
+test("5.5: 目标身份相同的两个 offer（不同 offerId）——第二次提议被重复守卫拦下", async () => {
+  // 同一个窗口里两个都叫「打开」的链接：identity 相同，offerId 不同。
+  // 单看 id 它们毫无关系（旧键正是拿 id 当键，这里会漏拦），按目标身份才是同一个目标。
+  const seen: Seen = [];
+  const a = axOffer("offer-a", "OPEN", "打开", "AXLink");
+  const b = axOffer("offer-b", "OPEN", "打开", "AXLink");
+  const d = axDeps([decision(a.id), decision(b.id), decision("DONE")]);
+
+  const state = await runLoop("打开那个链接", axOfferSet("frame-1", [a, b]), d, axOpt(axFrame("frame-1", [a, b]), axPeer(seen)));
+
+  assert.equal(state.status, "blocked");
+  assert.match(state.steps.at(-1)!.reasons.join(""), /第二次提议/);
+  assert.equal(performs(seen).length, 1, "同一个目标只允许发出去一次");
+});
+
+test("5.5: 目标身份不同时不误伤——两个不同的按钮各执行一次", async () => {
+  // 阳性对照：上面的拦截不是「AX 动作一律只放行一次」这种过宽行为
+  const seen: Seen = [];
+  const a = axOffer("offer-a", "OPEN", "打开", "AXLink");
+  const b = axOffer("offer-b", "OPEN", "取消", "AXLink");
+  const d = axDeps([decision(a.id), decision(b.id), decision("DONE")]);
+
+  const state = await runLoop("打开再取消", axOfferSet("frame-1", [a, b]), d, axOpt(axFrame("frame-1", [a, b]), axPeer(seen)));
+
+  assert.equal(state.status, "done");
+  assert.equal(performs(seen).length, 2, "身份不同，两个目标都该放行");
+});
+
+test("5.5: 跨挂起两次观察给出不同 offerId 却同一目标——第二次提议仍被拦下", async () => {
+  // 第一次观察（frame-1）里 OPEN「打开」执行过一次；挂起后重新观察（frame-2）给了同一个目标
+  // 一个**新的 offerId**。键要是 offerId，这一次就会被当成全新动作放行——正是这条判据要堵的洞：
+  // 多步 AX 每步刷新 frame 时，同一个按钮会被点第二次。这里用挂起-恢复模拟「两次观察」，
+  // 因为本阶段一个 run 只观察一次（设计 §6），两次观察只可能跨在挂起两侧。
+  const seen1: Seen = [];
+  const open1 = axOffer("open-1", "OPEN", "打开", "AXLink");
+  const click1 = axOffer("click-1", "CLICK", "确定");
+  const paused = await runLoop(
+    "打开再点确定",
+    axOfferSet("frame-1", [open1, click1]),
+    axDeps([decision(open1.id), decision(click1.id)]),
+    axOpt(axFrame("frame-1", [open1, click1]), axPeer(seen1)),
+  );
+  assert.equal(paused.status, "waiting_for_confirmation");
+  assert.equal(performs(seen1).length, 1, "第一个 OPEN 已经执行过一次");
+
+  const seen2: Seen = [];
+  const open2 = axOffer("open-2", "OPEN", "打开", "AXLink");
+  const click2 = axOffer("click-2", "CLICK", "确定");
+  // 恢复先认领挂起的 CLICK（新的 click-2），下一步模型又提议 OPEN——新的 open-2
+  const after = await resumeLoop(
+    paused,
+    axOfferSet("frame-2", [open2, click2]),
+    true,
+    axDeps([decision(open2.id)]),
+    axOpt(axFrame("frame-2", [open2, click2]), axPeer(seen2)),
+  );
+
+  assert.equal(after.status, "blocked");
+  assert.match(after.steps.at(-1)!.reasons.join(""), /第二次提议/);
+  assert.deepEqual(
+    performs(seen2).map((p) => (p.params as { offerId: string }).offerId),
+    ["click-2"],
+    "只发过恢复那一次的 click-2；同目标的 open-2 即便换了新 id 也被拦下",
+  );
+});
+
+test("5.5: 恢复时目标消失——blocked，且 ax.perform 零调用", async () => {
+  const seen1: Seen = [];
+  const click = axOffer("offer-old", "CLICK", "确定");
+  const offers1 = axOfferSet("frame-1", [click]);
+  const paused = await runLoop("点确定", offers1, axDeps([decision(click.id)]), axOpt(axFrame("frame-1", [click]), axPeer(seen1)));
+  assert.equal(paused.status, "waiting_for_confirmation");
+  assert.equal(performs(seen1).length, 0, "挂起那一刻什么都不发");
+  assert.deepEqual(
+    [paused.pending?.target?.operation, paused.pending?.target?.app, paused.pending?.target?.role, paused.pending?.target?.label],
+    ["CLICK", AX_APP, "AXButton", "确定"],
+    "挂起时把目标身份记下来，恢复要靠它重新认领",
+  );
+
+  // 恢复：新 frame 里没有这个目标
+  const seen2: Seen = [];
+  const other = axOffer("offer-other", "CLICK", "取消");
+  const after = await resumeLoop(
+    paused,
+    axOfferSet("frame-2", [other]),
+    true,
+    axDeps(),
+    axOpt(axFrame("frame-2", [other]), axPeer(seen2)),
+  );
+
+  assert.equal(after.status, "blocked");
+  assert.match(after.steps.at(-1)!.reasons.join(""), /目标已经不在当前界面上/);
+  assert.equal(performs(seen2).length, 0, "目标不在，一次都不执行");
+});
+
+test("5.5: 恢复时同身份命中不止一个——无法确定批准的是哪一个，blocked 且零执行", async () => {
+  const click = axOffer("offer-old", "CLICK", "确定");
+  const paused = await runLoop(
+    "点确定",
+    axOfferSet("frame-1", [click]),
+    axDeps([decision(click.id)]),
+    axOpt(axFrame("frame-1", [click]), axPeer([])),
+  );
+
+  const seen: Seen = [];
+  const t1 = axOffer("t-1", "CLICK", "确定");
+  const t2 = axOffer("t-2", "CLICK", "确定");
+  const after = await resumeLoop(
+    paused,
+    axOfferSet("frame-2", [t1, t2]),
+    true,
+    axDeps(),
+    axOpt(axFrame("frame-2", [t1, t2]), axPeer(seen)),
+  );
+
+  assert.equal(after.status, "blocked");
+  assert.match(after.steps.at(-1)!.reasons.join(""), /目标已经不在当前界面上/);
+  assert.equal(performs(seen).length, 0, "认领不唯一就当成「批准的东西不在了」");
+});
+
+test("5.5: 恢复时目标还在（新 offerId）——按身份重新认领，perform 收到新 frame + 新 offer", async () => {
+  const click = axOffer("offer-old", "CLICK", "确定");
+  const paused = await runLoop(
+    "点确定",
+    axOfferSet("frame-1", [click]),
+    axDeps([decision(click.id)]),
+    axOpt(axFrame("frame-1", [click]), axPeer([])),
+  );
+  assert.equal(paused.status, "waiting_for_confirmation");
+
+  const seen: Seen = [];
+  const clickNew = axOffer("offer-new", "CLICK", "确定");
+  const after = await resumeLoop(
+    paused,
+    axOfferSet("frame-2", [clickNew]),
+    true,
+    axDeps(),
+    axOpt(axFrame("frame-2", [clickNew]), axPeer(seen)),
+  );
+
+  assert.equal(after.status, "done");
+  assert.deepEqual(
+    performs(seen),
+    [{ method: "ax.perform", params: { frameId: "frame-2", offerId: "offer-new", operation: "CLICK" } }],
+    "执行的是新 frame 里的新 offer，不是挂起时那对必然过期的 id",
+  );
+  assert.equal(after.steps[0].actionId, "offer-new", "账上记的是实际执行的那个 offer");
+});
+
+// ── 5.6 切片路径：TYPE_TEXT 的 text 与「缺输入」收手 ─────────────────────────
+//
+// 这一组同样走**真的 runAction**，判据里的「ax.perform 零调用」才是有意义的 0。
+// 两条合起来压住一件事的两面：有值就逐字发出去、没值就收手去问用户，绝不发半条动作。
+
+/** 一个可编辑文本框的 TYPE_TEXT offer：draft/safe，policy 会放行它自动执行。 */
+function textOffer(id: string): AxActionOffer {
+  return {
+    id,
+    operation: "TYPE_TEXT",
+    target: { ref: "opaque", role: "AXTextField", label: "内容", state: { enabled: true, editable: true } },
+    effect: "draft",
+    risk: "safe",
+  };
+}
+
+test("5.6: span 有值时逐字进 ax.perform 的 value，一步走完", async () => {
+  const seen: Seen = [];
+  const field = textOffer("type-1");
+  const d = axDeps([decision(field.id, { span: "开会要点", bodySource: SPAN_SOURCE }), decision("DONE")]);
+
+  const state = await runLoop("把开会要点打进那个框", axOfferSet("frame-1", [field]), d, axOpt(axFrame("frame-1", [field]), axPeer(seen)));
+
+  assert.equal(state.status, "done");
+  assert.deepEqual(
+    performs(seen).map((p) => (p.params as { value?: string }).value),
+    ["开会要点"],
+    "发出去的就是用户原话里那一段，逐字",
+  );
+});
+
+test("5.6: 切不出文本时收手为 needs_input，且 ax.perform 零调用", async () => {
+  // 没有 bodySource 就没有文本来源。用 span:null + bodySource:null 模拟「模型挑不出可用的片段」
+  const seen: Seen = [];
+  const field = textOffer("type-1");
+  const d = axDeps([decision(field.id, { span: null, bodySource: null }), decision("DONE")]);
+
+  const state = await runLoop("打点字进去", axOfferSet("frame-1", [field]), d, axOpt(axFrame("frame-1", [field]), axPeer(seen)));
+
+  assert.equal(state.status, "needs_input");
+  assert.deepEqual(performs(seen), [], "缺输入就不该发出任何动作");
+  // 缺输入不是失败：不该出现「重新观察改走其他路径」这类恢复预算的提示
+  assert.equal(state.steps[0].reasons.join("").includes("恢复"), false);
+});
+
+
+// ── 对抗性复核补测（阶段 5 收口）──────────────────────────────────────────
+
+test("复核: AX 动作恢复时不被 Chrome profile 闸误伤——它的 app 不是 Chrome", async () => {
+  // resumeLoop 要判「确认期间世界变了没有」，其中 profile 那条判据**只对 Chrome 生效**。
+  // 判定依据是待执行动作归属的 app。AX 动作的 app 只能从挂起时记下的目标身份里取：
+  // 恢复时的 offerSet 是拿**新 frame** 重建的，挂起时那个 offerId 在里面必然查不到。
+  // 去 offerSet 里查旧 id 的话 app 恒为 undefined，staleness 的缺省会把它当 Chrome，
+  // 于是一次与 Chrome 毫无关系的 Finder 点击，会因为 Chrome profile 探测结果变了而被拦死。
+  const seen: Seen = [];
+  const click1 = axOffer("click-1", "CLICK", "确定");
+  const paused = await runLoop(
+    "点确定",
+    axOfferSet("frame-1", [click1]),
+    axDeps([decision(click1.id), decision("DONE")]),
+    { ...axOpt(axFrame("frame-1", [click1]), axPeer(seen)), profile: ALLOWED },
+  );
+  assert.equal(paused.status, "waiting_for_confirmation", "change 档的 AX 动作要先问人");
+
+  // 恢复这一刻 Chrome profile 探测不出来了（用户关掉了 Chrome）。前台还是 Finder，
+  // 窗口标题也没变——对一次 Finder 点击来说，世界没有任何相关的变化。
+  const seen2: Seen = [];
+  const click2 = axOffer("click-2", "CLICK", "确定");
+  const after = await resumeLoop(
+    paused,
+    axOfferSet("frame-2", [click2]),
+    true,
+    axDeps([decision("DONE")]),
+    { ...axOpt(axFrame("frame-2", [click2]), axPeer(seen2)), profile: BLIND },
+  );
+
+  assert.equal(after.status, "done", "Chrome 的 profile 变没变，与一次 Finder 点击无关");
+  assert.deepEqual(
+    performs(seen2).map((p) => (p.params as { offerId: string }).offerId),
+    ["click-2"],
+    "人批准的那个目标在新 frame 里被重新认领并执行",
+  );
+});
+
+test("复核: 挂起留痕不原样落下 AX 的 offerId——它和 judge 里的 targetId 是同一个东西", async () => {
+  // judge 事件里这个值叫 targetId，被明确指纹化（redact.ts：Swift 现铸、外部来源）。
+  // 同一个值经 suspend 事件的 actionId 字段落盘时若走白名单原样保留，等于换个字段名就绕开了脱敏。
+  // 脚本动作的 actionId（`Notes.make-note`）是本系统常量，不受这条影响。
+  const events: { phase: string; data: unknown }[] = [];
+  const click = axOffer("click-1", "CLICK", "确定");
+  const d = axDeps([decision(click.id)]);
+  d.record = (phase, _step, data) => {
+    events.push({ phase, data });
+    return Promise.resolve();
+  };
+
+  await runLoop("点确定", axOfferSet("frame-1", [click]), d, axOpt(axFrame("frame-1", [click]), axPeer([])));
+
+  const suspend = events.find((e) => e.phase === "suspend")!.data as Record<string, unknown>;
+  assert.equal(suspend.actionId, undefined, "AX 的 offerId 不该占用「本系统常量」那个字段名");
+  assert.equal(suspend.targetId, "click-1", "它该走 targetId——redact 对这个字段名一律指纹化");
 });

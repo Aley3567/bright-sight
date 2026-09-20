@@ -1,13 +1,14 @@
 import { randomUUID } from "node:crypto";
+import type { AxActionOffer, AxExecContext } from "./ax.ts";
 import { LIMITS } from "./config.ts";
-import type { BodySource, Decision, JudgeInput } from "./decide.ts";
+import { executionActionId, type BodySource, type Decision, type JudgeInput } from "./decide.ts";
 import { ARTIFACT_PREFIX, SPAN_SOURCE, resolveArgs, type ExecContext, type ExecOutcome } from "./execute.ts";
 import { freshnessMark, policy, staleness, type PolicyResult } from "./policy.ts";
 import { REGISTRY } from "./scripts.ts";
 import { extractSpans } from "./spans.ts";
 import type { OfferSet } from "./surface.ts";
 import { probeIdFor, type Probe, type VerifyInput } from "./verify.ts";
-import { isTaskAction, type Artifact, type PendingConfirmation, type ProfileGate, type RunState, type Snapshot, type StepRecord, type VerifyResult } from "./types.ts";
+import { isTaskAction, type Artifact, type AxTargetIdentity, type PendingConfirmation, type ProfileGate, type RunState, type Snapshot, type StepRecord, type VerifyResult } from "./types.ts";
 
 /**
  * 四步闭环的编排：observe → judge → act → verify，反复直到收手。
@@ -68,6 +69,14 @@ export type LoopOptions = {
    * 没有它就只能用步数之类可预测的东西当 id，而那样的 id 挡不住重放。
    */
   mintConfirmId?: () => string;
+  /**
+   * 这一轮的 AX 动作面与反向调用通道。省略等于「本轮没有 AX」，AX 动作于是没有任何执行路径。
+   *
+   * 它是一个 run 级的常量，不是每步刷新——Swift 的 frame 是单次消费的，一段指令只观察一次
+   * （本阶段的能力上限，见设计 §6）。恢复时必须换一份**重新观察**出来的（`cli.ts` 的恢复闭包负责），
+   * 沿用挂起那一刻的 frame 等于拿一个必然过期的 offer 去执行。
+   */
+  ax?: AxExecContext;
 };
 
 /** 产物值可能很长（网页标题、URL），给模型看摘要就够，完整值只在代码里流转。 */
@@ -91,12 +100,62 @@ function bodySourcesFrom(artifacts: readonly Artifact[], span: string | null): B
   return out;
 }
 
-/** 重复守卫的键：同一个动作配同一组解析结果，第二次提议就说明在原地打转。 */
+/**
+ * 一个 AX offer 的目标身份。role / label 取自 offer，app 取自这一帧归属的前台应用。
+ * offer 不在这一帧里时返回 undefined——它就不是一个能认领的 AX 目标。
+ */
+function axTargetOf(ax: AxExecContext | undefined, offer: AxActionOffer | undefined): AxTargetIdentity | undefined {
+  if (!ax || !offer) return undefined;
+  return { operation: offer.operation, app: ax.app, role: offer.target.role, label: offer.target.label };
+}
+
+/**
+ * 目标身份的规范串。
+ *
+ * 用 JSON 数组而不是拼 `|`：label 是用户界面上的文字，完全可能自带分隔符，拼串会让两个
+ * 不同的目标（例如 `a|b` 与 `a` + `b`）得到同一个键。JSON 转义把这件事堵死在编码层。
+ */
+function axTargetKey(t: AxTargetIdentity): string {
+  return `AX|${JSON.stringify([t.operation, t.app, t.role, t.label])}`;
+}
+
+/** 在 `ax.offers` 里按 offerId 找出目标身份。 */
+function axTargetById(ax: AxExecContext | undefined, offerId: string): AxTargetIdentity | undefined {
+  return axTargetOf(ax, ax?.offers.find((o) => o.id === offerId));
+}
+
+/**
+ * 在新 frame 里按目标身份重新认领一个 offer，返回它的 id。
+ *
+ * 宁可漏认不认错：命中数不等于 1（0 个或 ≥2 个）时返回 null，调用方据此 blocked。
+ * 「≥2 个」不是理论情形——同一窗口里两个都叫「确定」的按钮就是命中两个，
+ * 此时无法确定人批准的是哪一个，唯一安全的答案是「不执行」。
+ */
+function claimTarget(ax: AxExecContext | undefined, target: AxTargetIdentity): string | null {
+  if (!ax) return null;
+  const want = axTargetKey(target);
+  const hits = ax.offers.filter((o) => axTargetKey(axTargetOf(ax, o)!) === want);
+  return hits.length === 1 ? hits[0].id : null;
+}
+
+/**
+ * 重复守卫的键：同一个动作配同一组解析结果，第二次提议就说明在原地打转。
+ *
+ * 脚本动作按 actionId + 解析出的 argv 做键。AX 动作没有 argv，而 offerId 每次 observe 都变——
+ * 拿 id 当键等于没有守卫（同一个按钮换一帧就是新键，多步刷新 frame 会直接击穿）。
+ * 所以换成**目标身份**（operation + app + role + label），刻意不含 offerId 与 frameId。
+ * 代价是两个同名按钮被当成同一个目标；这是「宁可漏做，不可重做」的保守方向，
+ * 也是第 7 节里「按 label 重新认领目标」被否掉的同一个理由。
+ */
 function guardKey(actionId: string, ctx: ExecContext): string {
   const t = REGISTRY[actionId];
-  if (!t) return `${actionId}|<无模板>`;
-  const r = resolveArgs(t, ctx);
-  return `${actionId}|${r.ok ? JSON.stringify(r.argv) : "<解析失败>"}`;
+  if (t) {
+    const r = resolveArgs(t, ctx);
+    return `${actionId}|${r.ok ? JSON.stringify(r.argv) : "<解析失败>"}`;
+  }
+  const target = axTargetById(ctx.ax, actionId);
+  if (target) return axTargetKey(target);
+  return `${actionId}|<无模板>`;
 }
 
 function summarize(rec: StepRecord): string {
@@ -251,7 +310,12 @@ async function resumeSteps(
   const drift = staleness({
     mark: cp.freshness,
     now: freshnessMark(snapshot, opts.profile),
-    app: offerSet.specs.get(pending.actionId)?.app,
+    // AX 动作的 app 只能从挂起时记下的目标身份里取，去 offerSet 里查是查不到的：
+    // 这里的 offerSet 是拿**新 frame** 重建的，挂起时那个 offerId 在新 frame 里已经不存在。
+    // 查不到就是 undefined，而 staleness 的缺省把 undefined 当 Chrome（缺省收紧），
+    // 于是一次与 Chrome 毫无关系的点击，会因为 Chrome profile 探测结果变了而被拦死。
+    // 脚本动作没有 target，仍按 id 查 specs——它的 id 是冻结常量，跨挂起有效。
+    app: pending.target?.app ?? offerSet.specs.get(pending.actionId)?.app,
   });
   // observe 必须排在这条之前（先看清楚才谈得上判定），所以留痕里的顺序是 observe → resume
   await deps.record?.("resume", pending.step, {
@@ -267,11 +331,30 @@ async function resumeSteps(
   // 这一步实际执行时面对的是新快照，账上就该记新的那份
   rec.observe = snapshot;
 
-  const ctx: ExecContext = { span: cp.span, bodySource: cp.bodySource, artifacts: state.artifacts };
+  // AX 目标的重认领。挂起时那对 (frameId, offerId) 到这一刻必然作废——frame 是单次消费的，
+  // 换一次观察就是新 id。但人批准的是「那一刻那个东西」，不是那个 id，所以在新 frame 里按
+  // (operation, app, role, label) 重新找它。要求**恰好唯一**命中：找不到（目标没了）或
+  // 找到不止一个（两个同名按钮），都当成「他批准的那个东西不在了」，就地 blocked，绝不执行。
+  // 刻意否掉「直接拿挂起时那对 id 去执行」：它要么必然 rejected_stale，
+  // 要么要求 frame TTL 长到覆盖人的思考时间——后者等于取消 freshness。
+  let actionId = pending.actionId;
+  if (pending.target) {
+    const claimed = claimTarget(opts.ax, pending.target);
+    if (!claimed) {
+      rec.reasons.push("目标已经不在当前界面上，没有执行");
+      state.status = "blocked";
+      return state;
+    }
+    // 账上记的是**实际执行的那个** offer：旧 offerId 从没被发出去过
+    actionId = claimed;
+    rec.actionId = claimed;
+  }
+
+  const ctx: ExecContext = { span: cp.span, bodySource: cp.bodySource, artifacts: state.artifacts, ax: opts.ax };
   const verdict = await performAction(rt, deps, limits, {
     step: pending.step,
     rec,
-    actionId: pending.actionId,
+    actionId,
     ctx,
     recorded: true,
   });
@@ -312,6 +395,9 @@ async function drive(
 
     // 决策消费一次：判断已经产生，后面无论走哪条分支都不会再用这一份
     const j = decision.judgement;
+    // 执行层只认一个动作 id：AX 的两级 head 在这里合成——action 说「用哪类能力」，
+    // targetId 说「对谁做」。少了这一步，模型选了 AX 动作也会被 policy 当成未提供的选项拦掉。
+    const actionId = executionActionId(decision);
 
     let p: PolicyResult;
     if (decision.violations.length > 0) {
@@ -320,10 +406,13 @@ async function drive(
       p = { kind: "ignore", actionId: null, reasons: decision.violations };
     } else {
       p = policy({
-        judgement: j,
+        // 交给 policy 的是合成后的 id（判断其余字段不变），它按这个 id 查动作面、算 spec
+        judgement: { ...j, action: actionId },
         offered: offerSet.ids,
-        spec: offerSet.specs.get(j.action),
-        template: REGISTRY[j.action],
+        // 两类 spec 分开存：脚本动作在 specs，AX 动作在 axSpecs。漏掉后一支，AX 动作
+        // 走到 policy 时 spec 就成了 undefined，会被「动作面里没有这个 id」静默拦死。
+        spec: offerSet.specs.get(actionId) ?? offerSet.axSpecs.get(actionId),
+        template: REGISTRY[actionId],
         profile: opts.profile,
       });
     }
@@ -332,7 +421,7 @@ async function drive(
       step,
       observe: snapshot,
       judgement: j,
-      actionId: p.actionId ?? j.action,
+      actionId: p.actionId ?? actionId,
       exec: null,
       verify: null,
       reasons: p.reasons,
@@ -365,6 +454,8 @@ async function drive(
         confirmId: mint(),
         step,
         actionId: p.actionId,
+        // AX 动作记下目标身份，恢复时靠它在新 frame 里重新认领；脚本动作这里恒为 undefined
+        target: axTargetById(opts.ax, p.actionId),
         reasons: [...p.reasons],
         checkpoint: {
           // 待确认动作刻意**不**进 proposed：它还没执行过，先记上的话恢复时会被
@@ -385,7 +476,11 @@ async function drive(
       // policy 的 reasons 不记——那串文本里可能带 Chrome profile 目录名
       await deps.record?.("suspend", step, {
         confirmId: pending.confirmId,
-        actionId: pending.actionId,
+        // 脚本 / 任务层动作的 id 是本系统的冻结常量，不含用户内容，按 actionId 原样留痕；
+        // AX 的 offerId 是 Swift 每次观察现铸的外部串，与 judge 事件里的 targetId 是同一个值，
+        // 必须走同一个字段名，否则它就靠「换了个在白名单里的字段名」绕开了脱敏。
+        // 判据用 pending.target 而不是猜 id 的形状：有目标身份的必然是 AX 动作。
+        ...(pending.target ? { targetId: pending.actionId } : { actionId: pending.actionId }),
         gate: opts.profile?.kind ?? "absent",
       });
       return;
@@ -394,7 +489,7 @@ async function drive(
     if (p.kind === "ignore") {
       state.steps.push(rec);
       // 终止不信任 DONE：模型说完成了，还得每一步都验证通过才算数
-      if (j.action === "DONE") {
+      if (actionId === "DONE") {
         const executed = state.steps.filter((s) => s.exec !== null);
         const hasVerifiedAction = executed.some((s) => s.verify?.ok === true);
         if (hasVerifiedAction && !rt.unresolvedFailure) {
@@ -418,6 +513,7 @@ async function drive(
       span: decision.span,
       bodySource: decision.bodySource,
       artifacts: state.artifacts,
+      ax: opts.ax,
     };
     const verdict = await performAction(rt, deps, limits, {
       step,
@@ -473,6 +569,15 @@ async function performAction(
   // 执行后先记录再观察：万一取快照或验证炸了，这次真实发生过的动作也不能从账上消失
   push();
   await deps.record?.("act", step, outcome.result);
+
+  // 执行层报 stop：切片切不出动作需要的内容，连调用都没发生。它不是失败——
+  // 缺输入重试多少次还是缺，所以既不消耗恢复预算、也不触发「换条路重试」，
+  // 就地收手去问用户缺什么。
+  if (outcome.stop === "needs_more_input") {
+    rec.reasons.push("这一步需要更多信息才能执行，没有发出任何动作");
+    state.status = "needs_input";
+    return "stop";
+  }
 
   // 观察与验证都可能抛：探针是另一次 Apple Event，应用随时可能没响应。
   // 但动作已经真实发生了，异常不能把它连同整条 state 一起带走——

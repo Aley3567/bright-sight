@@ -1,4 +1,5 @@
 import type { AllowedApp } from "./config.ts";
+import type { CapabilityEffect } from "./types.ts";
 
 /**
  * 冻结的脚本模板注册表。
@@ -31,6 +32,25 @@ import type { AllowedApp } from "./config.ts";
  * 删除模板去证明闸门真的会拦。测试里那条模板不在 REGISTRY 中。
  */
 export type ScriptEffect = "create" | "navigate" | "read" | "destroy";
+
+/**
+ * 脚本模板的副作用词表 → 能力词表。
+ *
+ * 保留两套词表而不是把 ScriptEffect 直接改掉，是因为这个映射本身是要被审查的：
+ * `create` 折到 `draft` 是本次最值得商榷的一步——新建一条笔记是本地写入、不对外发送，
+ * 所以是「填写但不发送」而不是「提交」。这个判断如果错了，写在这里比散在
+ * 每个消费点上更容易被看见、被推翻。三个同名项保留原样，只有 create 变。
+ */
+const CAPABILITY_EFFECT: Readonly<Record<ScriptEffect, CapabilityEffect>> = {
+  create: "draft",
+  navigate: "navigate",
+  read: "read",
+  destroy: "destroy",
+};
+
+export function capabilityEffectOf(effect: ScriptEffect): CapabilityEffect {
+  return CAPABILITY_EFFECT[effect];
+}
 
 export type ScriptTemplate = {
   id: string;

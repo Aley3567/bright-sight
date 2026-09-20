@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { THRESHOLDS, freshnessMark, policy, staleness } from "../src/policy.ts";
 import { REGISTRY } from "../src/scripts.ts";
-import type { ActionSpec, Judgement, ProfileGate, Snapshot } from "../src/types.ts";
+import type { AxActionSpec, Judgement, ProfileGate, ScriptActionSpec, Snapshot } from "../src/types.ts";
 
 const NOTE = "Notes.make-note";
 const OFFERED = [NOTE, "Google Chrome.make-tab", "ASK", "WAIT", "DONE", "BLOCKED", "UNSUPPORTED"];
@@ -20,8 +20,8 @@ function judgement(over: Partial<Judgement> = {}): Judgement {
   };
 }
 
-function spec(over: Partial<ActionSpec> = {}): ActionSpec {
-  return { id: NOTE, app: "Notes", summary: "新建笔记", kind: "script", params: [], risk: "safe", ...over };
+function spec(over: Partial<ScriptActionSpec> = {}): ScriptActionSpec {
+  return { id: NOTE, app: "Notes", summary: "新建笔记", kind: "script", params: [], risk: "safe", effect: "draft", ...over };
 }
 
 const ok = { offered: OFFERED, spec: spec(), template: REGISTRY[NOTE] };
@@ -207,6 +207,103 @@ test("policy: dry-run 不是万能通行证——前三道硬闸照样拦", () =
   });
   assert.equal(r.kind, "confirm");
   assert.match(r.reasons.join(""), /破坏性/);
+});
+
+// ── AX 动作面：第四道硬闸与按 kind 分流 ──────────────────────────────────────
+//
+// AX 动作没有 ScriptTemplate，此前会直接落进 `if (!template)` 那条 ignore——
+// 也就是「静默放过」。新判据和旧判据在同一条路径上（policy 的第 128-134 行一带），
+// 所以除了「新分支拦得住」，还要压住「它不越界到脚本动作」和「两条同时可能命中时的优先级」。
+
+const AX_ID = "01924f4c-0000-7000-8000-000000000abc";
+const AX_OFFERED = [AX_ID, ...OFFERED];
+
+function axSpec(over: Partial<AxActionSpec> = {}): AxActionSpec {
+  return {
+    kind: "ax",
+    id: AX_ID,
+    app: "Finder",
+    summary: "AX CLICK：继续",
+    params: [],
+    risk: "safe",
+    effect: "change",
+    frameId: "frame-1",
+    operation: "CLICK",
+    ...over,
+  };
+}
+
+test("policy: AX 动作的写档一律确认——change / submit / destroy 三条都拦得住", () => {
+  for (const effect of ["change", "submit", "destroy"] as const) {
+    const r = policy({ judgement: judgement({ action: AX_ID }), offered: AX_OFFERED, spec: axSpec({ effect }) });
+    assert.equal(r.kind, "confirm", `effect=${effect} 应当确认`);
+    assert.equal(r.actionId, AX_ID);
+  }
+});
+
+test("policy: 不越界——AX 的读/导航/草稿档不被第四道闸误伤，照样自动执行", () => {
+  // 阳性对照：闸确实在按 effect 判档，而不是「AX 一律确认」
+  for (const effect of ["read", "navigate", "draft"] as const) {
+    const r = policy({ judgement: judgement({ action: AX_ID }), offered: AX_OFFERED, spec: axSpec({ effect }) });
+    assert.equal(r.kind, "execute", `effect=${effect} 不该被拦`);
+  }
+});
+
+test("policy: 不越界——AX 动作的应用名不在 Apple Event 白名单内也照样可以执行", () => {
+  // ALLOWED_APPS 管的是「哪些应用允许发 Apple Event」，AX 不发 Apple Event。
+  // 目标通常是前台应用（Finder、任意第三方 App），它们永远不在名单里。
+  const ax = policy({ judgement: judgement({ action: AX_ID }), offered: AX_OFFERED, spec: axSpec({ app: "Finder", effect: "navigate" }) });
+  assert.equal(ax.kind, "execute");
+  // 不越界不等于放水：同一份判断换成脚本动作，白名单这道闸仍然拦得住
+  const script = policy({ judgement: judgement({ action: NOTE }), offered: OFFERED, spec: spec({ app: "Finder" }), template: REGISTRY[NOTE] });
+  assert.equal(script.kind, "ignore");
+  assert.match(script.reasons.join(""), /白名单/);
+});
+
+test("policy: AX 动作不受 Chrome profile 闸影响——它不发 Apple Event，就没有登录态可问", () => {
+  const unknown: ProfileGate = { kind: "unknown", dir: "Profile 7" };
+  const ax = policy({
+    judgement: judgement({ action: AX_ID }),
+    offered: AX_OFFERED,
+    spec: axSpec({ effect: "navigate" }),
+    profile: unknown,
+  });
+  assert.equal(ax.kind, "execute", "AX 路径上不该出现一大片无意义的确认气泡");
+  // 不越界也不等于把闸拆了：同一个 profile 下 Chrome 脚本动作仍然要确认
+  const chrome = policy({ judgement: judgement({ action: TAB }), ...tabOk, profile: unknown });
+  assert.equal(chrome.kind, "confirm");
+});
+
+test("policy: AX 动作的低置信度转成追问而不是确认——先问清该不该做", () => {
+  const r = policy({
+    judgement: judgement({ action: AX_ID, confidence: THRESHOLDS.execute - 0.1 }),
+    offered: AX_OFFERED,
+    spec: axSpec({ effect: "navigate" }),
+  });
+  assert.equal(r.kind, "ask");
+  assert.match(r.reasons.join(""), /置信度/);
+});
+
+test("policy: 硬闸优先于置信度——AX 的写档即便置信度极低也仍是确认，不被降级成追问", () => {
+  const r = policy({
+    judgement: judgement({ action: AX_ID, confidence: 0.01, complete: 0.01 }),
+    offered: AX_OFFERED,
+    spec: axSpec({ effect: "change" }),
+  });
+  assert.equal(r.kind, "confirm", "confirm 要人确认，ask 不要，降级等于放松");
+});
+
+test("policy: 两个现存脚本动作的 effect 换了词表之后行为逐字不变", () => {
+  // make-tab 的模板 effect 是 navigate、Notes 的是 create→draft，两条都仍然自动执行
+  const tab = policy({
+    judgement: judgement({ action: TAB }),
+    ...tabOk,
+    profile: { kind: "allowed", dir: "Default", via: "settings" },
+  });
+  assert.equal(tab.kind, "execute");
+
+  const note = policy({ judgement: judgement({ action: NOTE }), ...ok });
+  assert.equal(note.kind, "execute");
 });
 
 // ── freshness：挂起与恢复之间那段时间 ──

@@ -1,7 +1,7 @@
 import { resolveEngine, type SearchEngine } from "./config.ts";
 import { osa, parseReadback } from "./osa.ts";
 import { PROBES, type ScriptTemplate } from "./scripts.ts";
-import type { ExecResult, VerifyCheck, VerifyResult } from "./types.ts";
+import { isTaskAction, type AxExecFact, type ExecResult, type VerifyCheck, type VerifyResult } from "./types.ts";
 
 /**
  * 验证层：执行完到底有没有真的发生。
@@ -52,6 +52,25 @@ function check(name: string, ok: boolean, detail: string): VerifyCheck {
 }
 
 /**
+ * 把一次 AX 执行的事实折成一条 check。
+ *
+ * 只有 `executed` 且 Swift 复验通过才算成功。其余三条一律判负，**尤其 `effect_unknown`**：
+ * 它的语义是「副作用可能已经发生，禁止自动重试」——判成通过，上层就会以为这一步成功了，
+ * 而真相是它连自己做了什么都不知道。`rejected_stale`（frame/offer 已过期）与 `failed`
+ * （复验没看到预期变化）同样不是成功。
+ *
+ * status 与 detail 都进了这条 check 的文字，但 verify 事件的 detail 在留痕里会被指纹化
+ * （`redact.ts`），所以这里带上目标标签是安全的。
+ */
+function axTargetState(ax: AxExecFact): VerifyCheck {
+  return check(
+    "ax_target_state",
+    ax.status === "executed" && ax.verify.ok,
+    `status=${ax.status}；${ax.verify.detail}`,
+  );
+}
+
+/**
  * origin 比较而不是全等比较。
  *
  * 实测 Google 会把 `?q=erasableSyntaxOnly` 重写成 `?q=erasableSyntaxOnly&sei=...`，
@@ -99,6 +118,13 @@ export async function verify(input: VerifyInput): Promise<VerifyResult> {
       : check("exit_ok", false, exec.errors.join("；")),
   );
   if (!exec.ok) return { ok: false, checks };
+
+  // AX 动作：没有 argv、没有脚本回读、没有前后 diff，唯一的证据是 Swift 执行前后复验目标
+  // 状态得出的结论。把它折成同一条 check 纳入「全绿才算成功」这张表。
+  if (exec.ax) {
+    checks.push(axTargetState(exec.ax));
+    return { ok: checks.every((c) => c.ok), checks };
+  }
 
   if (actionId === "Google Chrome.make-tab") {
     const preW = num(pre?.windows);
@@ -163,6 +189,14 @@ export async function verify(input: VerifyInput): Promise<VerifyResult> {
           `回读容器 ${rb.account} / ${rb.folder}`));
       }
     }
+  }
+
+  // 认不出的动作**不再等于「执行成功即通过」**。任务层动作（ASK / DONE / …）不对应任何
+  // 应用命令，由 policy 在进入执行之前就分流掉，根本到不了这里；这条判负只针对真正无人认领的
+  // actionId（例如注册表外的脚本动作）。用 isTaskAction 显式排除，是为了让「不误伤任务层动作」
+  // 这件事不靠「policy 恰好先分流了」这一个隐含前提。
+  if (actionId !== "Google Chrome.make-tab" && actionId !== "Notes.make-note" && !isTaskAction(actionId)) {
+    checks.push(check("unknown_action", false, `${actionId} 不是已知可验证的动作，无法验证它的效果`));
   }
 
   return { ok: checks.every((c) => c.ok), checks };

@@ -3,6 +3,9 @@ import { readdir } from "node:fs/promises";
 import { LIMITS, resolveEngine } from "./config.ts";
 // 只用于给下面两处递归闭包写返回类型；`import type` 会被整条擦掉，不会破坏懒加载
 import type { SessionRunOutput } from "./session.ts";
+import type { AxExecContext } from "./ax.ts";
+import type { Surface } from "./actions.ts";
+import type { AxFrameView } from "./surface.ts";
 import type { RunState } from "./types.ts";
 
 const USAGE = `bright-sight — 不看屏幕的 macOS 桌面智能体
@@ -16,7 +19,7 @@ const USAGE = `bright-sight — 不看屏幕的 macOS 桌面智能体
   bright-sight serve
         长驻 JSON Lines RPC 服务端，供 macOS 语音条（apps/macos）使用。
         stdin 收请求、stdout 发响应，双向：核心也会反过来向 App 发起调用。
-        协议定义在 src/protocol.ts，那是两侧唯一的依据。人不该手动跑它。
+        人读契约在 src/protocol.ts；Swift 侧是会漂移的影子。人不该手动跑它。
 
   bright-sight surface [--all] [--rebuild]
         看动作面：从 sdef 自动长出来的全部命令，以及白名单过滤后真正递给模型的选项。
@@ -69,7 +72,7 @@ async function cmdRun(args: Args): Promise<number> {
   const { loadOffers } = await import("./surface.ts");
   const { runLoop } = await import("./loop.ts");
   const { judge } = await import("./decide.ts");
-  const { execute } = await import("./execute.ts");
+  const { runAction } = await import("./capability.ts");
   const { runProbe, verify } = await import("./verify.ts");
   const { openJournal } = await import("./journal.ts");
   const { snapshotLight } = await import("./perceive.ts");
@@ -117,7 +120,7 @@ async function cmdRun(args: Args): Promise<number> {
     {
       observe: snapshotLight,
       decide: (input) => judge(client, input),
-      act: (id, ctx, step) => execute(id, { ...ctx, engine }, step, { dryRun }),
+      act: (id, ctx, step) => runAction(id, { ...ctx, engine }, { step, dryRun }),
       // dry-run 不取快照：probe 本身无副作用，但让 pre/post 停在 null 才如实反映
       // "这一轮什么都没发生"，而不是拿真实计数去凑一份看起来成立的 diff
       probe: (id, argv) => (dryRun ? Promise.resolve(null) : runProbe(id, argv)),
@@ -175,10 +178,12 @@ const SERVE_DRAIN_TIMEOUT_MS = 90_000;
  * 两条路径共用同一个 `runLoop`，所以不会各自漂移。
  */
 async function cmdServe(_args: Args): Promise<number> {
-  const { loadOffers } = await import("./surface.ts");
+  const { offersFrom } = await import("./surface.ts");
+  const { loadSurface } = await import("./actions.ts");
+  const { observeAX } = await import("./ax.ts");
   const { runLoop, resumeLoop } = await import("./loop.ts");
   const { judge } = await import("./decide.ts");
-  const { execute } = await import("./execute.ts");
+  const { runAction } = await import("./capability.ts");
   const { runProbe, verify } = await import("./verify.ts");
   const { openJournal, ulid } = await import("./journal.ts");
   const { snapshotLight } = await import("./perceive.ts");
@@ -195,16 +200,24 @@ async function cmdServe(_args: Args): Promise<number> {
   const emit = process.stdout.write.bind(process.stdout);
   process.stdout.write = process.stderr.write.bind(process.stderr) as typeof process.stdout.write;
 
+  // 动作面走磁盘缓存，一次 run 一次。session.handle 先经 `deps.offers` 取它，`run` 紧接着
+  // 在**同一份** surface 上补上这一轮现观察的 AX offers——不重读磁盘，也不把 AX 并进那份缓存
+  // （脚本白名单是冻结的，AX offers 每轮都变，两者寿命不同）。
+  let surface: Surface | null = null;
+
   const peer = createPeer({
     write: (chunk) => void emit(chunk),
     // Node 一律用偶数 id，Swift 一律奇数。两侧各自分配 id，不切开空间就分不清回应归属
     idParity: "even",
     onTransportError: (error) => console.error(`[rpc] ${error.layer}/${error.code}: ${error.message}`),
     methods: makeSessionMethods({
-      offers: () => loadOffers(),
+      offers: async () => {
+        surface = await loadSurface();
+        return offersFrom(surface);
+      },
       // 只看变量在不在，不读值
       credentialsPresent: () => (process.env.TYPESAFE_API_KEY ?? "") !== "",
-      run: async ({ utterance, execute: doExecute, engine: engineName, offers, signal }) => {
+      run: async ({ utterance, execute: doExecute, engine: engineName, signal }) => {
         const { resolveEngine } = await import("./config.ts");
         const engine = resolveEngine(engineName);
         // serve 没有 TTY，没有人可以当场问。闸门状态原样交给 policy，让它拦成 confirm
@@ -215,11 +228,30 @@ async function cmdServe(_args: Args): Promise<number> {
         const journal = await openJournal({ redact: mode === "hash" ? redactor.event : undefined });
         const client = new TypeSafeClient();
 
+        // AX 动作面：每条指令观察一次当前 frame（本阶段一个 run 一个 frame，见设计 §6）。
+        // AX 是增强不是前提——观察失败（缺辅助功能授权、对端不可用）就降级成只有脚本动作，
+        // 不阻断整条指令；失败原因记进日志（stderr），不写进留痕。
+        const surfaceNow = surface ?? (await loadSurface());
+        const observeFrame = async (): Promise<AxFrameView | null> => {
+          try {
+            const observed = await observeAX(peer, { scope: "focusedWindow" });
+            const snap = await snapshotLight();
+            return { frameId: observed.frameId, pid: observed.pid, app: snap.front, offers: observed.offers };
+          } catch (err) {
+            console.error(`[ax] 观察失败，本轮降级为仅脚本动作：${err instanceof Error ? err.message : String(err)}`);
+            return null;
+          }
+        };
+        const axOf = (frame: AxFrameView | null): AxExecContext | undefined =>
+          frame ? { peer, frameId: frame.frameId, offers: frame.offers, app: frame.app } : undefined;
+
+        const frame = await observeFrame();
+
         const loopDeps = {
           observe: snapshotLight,
           decide: (input: Parameters<typeof judge>[1]) => judge(client, input, signal),
-          act: (id: string, ctx: Parameters<typeof execute>[1], step: number) =>
-            execute(id, { ...ctx, engine }, step, { dryRun: !doExecute }),
+          act: (id: string, ctx: Parameters<typeof runAction>[1], step: number) =>
+            runAction(id, { ...ctx, engine }, { step, dryRun: !doExecute }),
           probe: (id: string, argv?: string[]) => (doExecute ? runProbe(id, argv) : Promise.resolve(null)),
           checkStep: (input: Parameters<typeof verify>[0]) =>
             doExecute
@@ -242,16 +274,28 @@ async function cmdServe(_args: Args): Promise<number> {
           journal: { path: journal.path, redacted: mode === "hash", failures: journal.failures() },
           ...(state.status === "waiting_for_confirmation"
             ? {
-                resume: async (approved: boolean) =>
-                  wrap(await resumeLoop(state, offers, approved, loopDeps, { runId: journal.runId, profile: await gateNow() })),
+                resume: async (approved: boolean) => {
+                  // 恢复前重新观察一次 AX frame。挂起时那份 frame 是单次消费的，到这一刻已经过期；
+                  // 恢复要面对的是重新看到的那一帧，AX 动作据此在 `resumeSteps` 里重新认领目标。
+                  // 脚本白名单是冻结的，不重取——只有 AX offers 的寿命短到需要每轮新观察。
+                  const fresh = await observeFrame();
+                  return wrap(
+                    await resumeLoop(state, offersFrom(surfaceNow, fresh ?? undefined), approved, loopDeps, {
+                      runId: journal.runId,
+                      profile: await gateNow(),
+                      ax: axOf(fresh),
+                    }),
+                  );
+                },
               }
             : {}),
         });
 
         return wrap(
-          await runLoop(utterance, offers, loopDeps, {
+          await runLoop(utterance, offersFrom(surfaceNow, frame ?? undefined), loopDeps, {
             runId: journal.runId,
             profile: doExecute ? pre.gate : ({ kind: "dry-run" } as const),
+            ax: axOf(frame),
           }),
         );
       },

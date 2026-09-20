@@ -76,6 +76,23 @@ test("redact: judge 保留概率与判据，只抹掉从原话切出来的片段
   assert.equal(fp(out.span).len, 18);
 });
 
+test("redact: judge 的 targetId 是外部 offerId，按内容处理——指纹化而不是原样落盘", () => {
+  const r = makeRedactor("hash", SALT);
+  const offerId = "01924f4c-0000-7000-8000-000000000abc";
+  const out = r.event("judge", {
+    judgement: { action: "AX:CLICK", confidence: 0.92, backend: "fake" },
+    span: null,
+    bodySource: null,
+    targetId: offerId,
+    violations: [],
+  }) as Record<string, unknown>;
+  assert.notEqual(out.targetId, offerId, "外部 id 不能原样进留痕");
+  assert.equal(fp(out.targetId).len, offerId.length);
+  // targetId 为 null 时不编一个假指纹
+  const out2 = r.event("judge", { judgement: {}, span: null, bodySource: null, targetId: null, violations: [] }) as Record<string, unknown>;
+  assert.equal(out2.targetId, null);
+});
+
 test("redact: act 抹掉 argv 与回读值，保留字段名与结构", () => {
   const r = makeRedactor("hash", SALT);
   const out = r.event("act", {
@@ -92,6 +109,40 @@ test("redact: act 抹掉 argv 与回读值，保留字段名与结构", () => {
   // 同一个 URL 在 argv 和回读里应当得到同一个指纹——「发出去的和回读到的是不是同一个」
   // 正是留痕要回答的问题，脱敏不能把它一起抹掉
   assert.equal(fp((out.argv as unknown[])[0]).h, fp(rb.url).h);
+});
+
+test("redact: act 的 ax 字段按白名单脱敏——status 与 verify.ok 保留，其余指纹化", () => {
+  const r = makeRedactor("hash", SALT);
+  const out = r.event("act", {
+    ok: true,
+    ms: 12,
+    argv: [],
+    readback: {},
+    ax: {
+      status: "executed",
+      verify: { ok: true, detail: "元素标题是 我的私密文档" },
+      // 白名单之外的字段：将来往 ax 里加字段时，忘记来这里补规则的后果必须是被指纹化
+      extra: "一段用户内容",
+    },
+  }) as Record<string, unknown>;
+
+  const ax = out.ax as Record<string, unknown>;
+  assert.equal(ax.status, "executed", "status 是枚举，是事后归因的关键");
+  const v = ax.verify as Record<string, unknown>;
+  assert.equal(v.ok, true, "verify.ok 是布尔，不含用户内容");
+  assert.ok(fp(v.detail).len > 0, "verify.detail 是给人看的一句话，可能带元素标签，要指纹化");
+  assert.ok(fp(ax.extra).len > 0, "白名单之外的 ax 字段必须被指纹化，而不是原样落盘");
+
+  // 阳性对照：这些原文确实在原始 data 里，所以「读不到」不是因为压根没写过它
+  const leaked = leakedStrings(ax);
+  assert.equal(leaked.some((s) => s.includes("我的私密文档")), false);
+  assert.equal(leaked.some((s) => s.includes("一段用户内容")), false);
+});
+
+test("redact: act 没有 ax 字段时不凭空造一个", () => {
+  const r = makeRedactor("hash", SALT);
+  const out = r.event("act", { ok: true, ms: 1, argv: [], readback: {} }) as Record<string, unknown>;
+  assert.equal("ax" in out, false);
 });
 
 test("redact: verify 保留判据名与通过与否，只抹掉 detail", () => {
@@ -129,6 +180,21 @@ test("redact: suspend 保留结构，但不放行任何待确认的理由文本"
   for (const leaked of leakedStrings(out.reasons)) {
     assert.equal(leaked.includes("Profile 7"), false, "profile 目录名不进留痕");
   }
+});
+
+test("redact: suspend 的 targetId 是 AX 的 offerId，按外部来源指纹化", () => {
+  // 同一个值在 judge 事件里叫 targetId、被明确指纹化。挂起留痕里它不能因为换了条事件
+  // 就原样落盘——suspend 的白名单只放行本系统自己的常量，offerId 是 Swift 现铸的外部串。
+  const r = makeRedactor("hash", SALT);
+  const out = r.event("suspend", {
+    confirmId: "01J0000000000000000000",
+    targetId: "ax-offer-7f3a1c",
+    gate: "absent",
+  }) as Record<string, unknown>;
+  assert.equal(out.confirmId, "01J0000000000000000000");
+  assert.equal(out.gate, "absent");
+  assert.equal(out.targetId === "ax-offer-7f3a1c", false, "offerId 不能原样落盘");
+  assert.ok(fp(out.targetId).len > 0, "它该落成指纹，而不是被整条抹掉");
 });
 
 test("redact: resume 保留 approved 与陈旧判据名，但判据的 detail 进不去", () => {

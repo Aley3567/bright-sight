@@ -1,3 +1,5 @@
+import type { AxActionStatus, AxOperation } from "./ax.ts";
+
 /**
  * 盲视（BrightSight）：不读屏幕像素的桌面智能体。
  *
@@ -12,23 +14,67 @@
  * 存储是自带的、不依赖任何外部系统——bright-sight/ 始终可以整个目录搬出去独立成仓。
  */
 
-/** 一个可被执行的语义动作，由应用脚本字典（sdef）或无障碍树推导而来。 */
-export type ActionSpec = {
+export type Risk = "safe" | "caution" | "destructive";
+
+/**
+ * 能力词表：一个动作「做了什么事」的统一分类。
+ *
+ * 脚本动作与 AX 动作原本各有一套词表（脚本用 create/navigate/read/destroy，
+ * AX 用 read/navigate/draft/submit/change/destroy），同一个概念在两个来源下有两个名字。
+ * 统一到这一张表之后，policy 才能不问出处地按 effect 判档——它要区分的正是
+ * 「读取」与「改动」这条线，而这条线对两类动作是同一件事。
+ */
+export type CapabilityEffect = "read" | "navigate" | "draft" | "submit" | "change" | "destroy";
+
+/**
+ * 脚本动作：来自 sdef，能不能执行由冻结的脚本注册表决定。
+ *
+ * `effect` 的权威值来自那个动作的 `ScriptTemplate`（模板作者知道后果），
+ * sdef 解析期给的只是初判——`make` 这个动词推不出「开标签页是 navigate、记笔记是 draft」。
+ */
+export type ScriptActionSpec = {
   /** 稳定标识，形如 `Notes.make-note`，用作决策层选项的键。 */
   id: string;
   /** 归属应用名，与 `tell application "<app>"` 中的名称一致。 */
   app: string;
   /** 给模型看的一句话说明；决策层只凭这句话和参数表判断该不该选它。 */
   summary: string;
-  kind: "script" | "ax" | "shell";
+  kind: "script";
   params: ActionParam[];
   /**
    * 危险等级：destructive 的动作即便概率很高也必须经人确认。
    * 该判断在动作面构建期就固定下来，不依赖模型每次重新判断，
    * 模型失准时安全闸不会跟着一起失准。
    */
-  risk: "safe" | "caution" | "destructive";
+  risk: Risk;
+  effect: CapabilityEffect;
 };
+
+/**
+ * AX 动作：来自一次 `ax.observe` 的 offer，只在它所属的那个 frame 里有效。
+ *
+ * 与脚本动作分开成判别联合而不是共用一条结构，是因为两者的**执行路径根本不同**：
+ * 脚本动作拼 argv、发 Apple Event、要查执行白名单；AX 动作只把 frame/offer 交给
+ * Swift 的 `ax.perform`，不发 Apple Event、不查白名单。把它们压成一条结构，
+ * 下游每个分支就得靠一堆「哪个字段有值」来推断走哪条路，安全判据最容易在那种分支里装错。
+ */
+export type AxActionSpec = {
+  /** Swift 每次 observe 现铸的 offerId——同一个按钮换一次观察就是新 id。 */
+  id: string;
+  /** 前台应用名，取自本地快照的 `snapshot.front`，不是远端给的。 */
+  app: string;
+  summary: string;
+  kind: "ax";
+  params: ActionParam[];
+  /** 自算后取严的结果，不是 Swift 原样发来的标签（见 `src/ax.ts` 的 `axCapabilityFor`）。 */
+  risk: Risk;
+  effect: CapabilityEffect;
+  /** 这个 offer 所属的 frame。id 只在它里面有效，两者必须一起走到底。 */
+  frameId: string;
+  operation: AxOperation;
+};
+
+export type ActionSpec = ScriptActionSpec | AxActionSpec;
 
 export type ActionParam = {
   name: string;
@@ -167,14 +213,26 @@ export type Artifact = {
 };
 
 /**
+ * 一次 AX 执行的业务事实。
+ *
+ * `status` 是 Swift 在线上给出的结局；`verify` 是它执行前后复验目标状态得出的结论。
+ * 两者一起挂在 `ExecResult` 上，因为「走的是脚本路还是 AX 路」正是由这个字段在不在来判断的——
+ * AX 动作没有 argv，`[]` 就是「这次没有 Apple Event 发出去」的准确表达，编一个非空 argv 才是失真。
+ */
+export type AxExecFact = {
+  status: AxActionStatus;
+  verify: { ok: boolean; detail: string };
+};
+
+/**
  * 执行结果。
  *
  * argv 无论成败都记录：安全审计要回答的问题是"到底发出去了什么"，
- * 失败的那次发出去了什么同样要能查。
+ * 失败的那次发出去了什么同样要能查。AX 动作的 argv 恒为 `[]`（它没有 argv）。
  */
 export type ExecResult =
-  | { ok: true; readback: Record<string, string>; argv: string[]; ms: number }
-  | { ok: false; errors: string[]; argv: string[]; ms: number };
+  | { ok: true; readback: Record<string, string>; argv: string[]; ms: number; ax?: AxExecFact }
+  | { ok: false; errors: string[]; argv: string[]; ms: number; ax?: AxExecFact };
 
 /**
  * Chrome profile 闸门状态。
@@ -265,6 +323,22 @@ export type LoopCheckpoint = {
 };
 
 /**
+ * 一个 AX 目标的**身份**：operation + 前台应用 + role + label。
+ *
+ * 刻意不含 `offerId` 与 `frameId`——它们每次观察都变，拿它们当键等于没有身份：同一个按钮
+ * 换一次 observe 就是新 id，重复守卫与恢复重认领都会因此落空。反过来，两个同 role 同 label
+ * 的按钮会被当成同一个目标，这是刻意接受的保守方向：**宁可漏做，不可重做**。
+ *
+ * 挂起时把它记下来，恢复时在新 frame 里按它重新认领（见 `loop.ts` 的 `resumeSteps`）。
+ */
+export type AxTargetIdentity = {
+  operation: AxOperation;
+  app: string;
+  role: string;
+  label: string;
+};
+
+/**
  * 一个等人拍板的动作。
  *
  * 它的存在本身就是「一个决定最多执行一次」的风险面：同一个决定在挂起和恢复两个时刻
@@ -277,6 +351,13 @@ export type PendingConfirmation = {
   /** 挂在第几步。恢复时从这一步继续，不新开一步。 */
   step: number;
   actionId: string;
+  /**
+   * AX 动作的目标身份；脚本动作为 `undefined`（脚本按 actionId 就能在新一轮里重新解析）。
+   *
+   * 挂起时那对 `(frameId, offerId)` 到恢复时必然过期（frame 单次消费），唯一还能据以
+   * 认出「他批准的是哪个目标」的东西就是这份身份。
+   */
+  target?: AxTargetIdentity;
   /** 为什么要问人，来自 policy。给人看的，不进留痕（里面可能带 profile 目录名）。 */
   reasons: string[];
   checkpoint: LoopCheckpoint;

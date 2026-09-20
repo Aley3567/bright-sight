@@ -1,14 +1,17 @@
 import { choice, noul, TypeSafeClient } from "@typesafe-ai/sdk";
+import type { AxOperation } from "./ax.ts";
+import type { Offer } from "./surface.ts";
 import type { ActionSpec, Judgement, Snapshot } from "./types.ts";
 import { isVerbatim } from "./spans.ts";
 
 /**
  * 决策层：把"当前机器状态 + 用户说的话"变成一个带概率的类型化判断。
  *
- * 这一层刻意定义成可替换后端。System One 模型（Jev）是当前实现，
- * 但闭环不依赖它的任何专有特性——选项集合由我们的动作面生成，
- * 阈值策略、安全闸、验证与留痕都在我们这边。换成任意支持结构化输出的
- * 模型，整个系统照常运行，只是延迟和成本不同。对照实验也靠这个接口。
+ * 闭环实际走的是 `judge(TypeSafeClient) → Decision`（含 span / bodySource / violations）。
+ * `DecisionBackend {route, pick} → Judgement` 是另一条 Interface，只有 `JevBackend`
+ * 一个 Adapter，生产调用在 `probe.ts`。换成任意支持结构化输出的模型，要换的是
+ * `judge` 吃的 client 与答案校验，不是插一个 `DecisionBackend`。阈值策略、安全闸、
+ * 验证与留痕都在我们这边，不依赖 System One 的专有特性。
  */
 export interface DecisionBackend {
   readonly name: string;
@@ -28,6 +31,17 @@ export type PickInput = { utterance: string; snapshot: Snapshot; actions: Action
  * 且每级的选项都更同质，概率分布因此更可分。
  */
 export const CHOICE_LIMIT = 255;
+
+/**
+ * 钉死的模型版本。
+ *
+ * SDK 不传 `model` 时落到 `jev-latest`，那是个**会往前滚的别名**——官方文档反复要求生产环境
+ * pin 到具体版本。别名漂移的后果不是报错而是行为变化：同一句话、同一个动作面，某天开始选
+ * 另一个目标，而留痕里看不出任何异常。
+ *
+ * 升级是一次需要重新验收的改动，不该由对面的发布节奏替我们决定什么时候发生。
+ */
+export const JEV_MODEL = "jev-1.13.0";
 
 /** 送进模型的状态要瘦：只保留能影响判断的字段，其余都是白花的 token。 */
 function stateOf(s: Snapshot, utterance: string) {
@@ -131,6 +145,17 @@ async function callModel<T>(
   }
 }
 
+/**
+ * 留痕里的后端标识：本地问的是谁 + 对面实际用的是哪个版本。
+ *
+ * 记响应里的 `model` 而不是只记我们请求的那个：pin 了不等于对面一定照办（别名、灰度、
+ * 账号级 default 都可能插一脚）。两个值不一致时，这是唯一能看出来的地方。
+ * 版本号是对面的公开常量，不含用户内容，所以它经得起 `redact` 的白名单保留。
+ */
+function backendTag(name: string, model: string | undefined): string {
+  return model ? `${name}/${model}` : name;
+}
+
 export class JevBackend implements DecisionBackend {
   readonly name = "jev";
   private client: TypeSafeClient;
@@ -150,6 +175,7 @@ export class JevBackend implements DecisionBackend {
     const r = await callModel((signal) =>
       this.client.systemOne(
         {
+          model: JEV_MODEL,
           state: stateOf(snapshot, utterance),
           questions: {
             app: choice("用户这句话想操作哪个应用？", opts),
@@ -168,7 +194,7 @@ export class JevBackend implements DecisionBackend {
       confidence: a.confidence ?? 0,
       complete: r.answers.complete.noul,
       destructive: r.answers.destructive.noul,
-      backend: this.name,
+      backend: backendTag(this.name, r.model),
       latency_ms: Date.now() - t0,
     };
   }
@@ -185,6 +211,7 @@ export class JevBackend implements DecisionBackend {
     const r = await callModel((signal) =>
       this.client.systemOne(
         {
+          model: JEV_MODEL,
           state: stateOf(snapshot, utterance),
           questions: {
             action: choice("应该执行哪一个命令来完成用户的要求？", opts),
@@ -202,7 +229,7 @@ export class JevBackend implements DecisionBackend {
       confidence: a.confidence ?? 0,
       complete: 1,
       destructive: r.answers.destructive.noul,
-      backend: this.name,
+      backend: backendTag(this.name, r.model),
       latency_ms: Date.now() - t0,
     };
   }
@@ -226,7 +253,11 @@ export type BodySource = { key: string; hint: string };
 export type JudgeInput = {
   utterance: string;
   snapshot: Snapshot;
-  offers: readonly { id: string; summary: string }[];
+  /**
+   * 递给模型的候选。带上 AX offer 的 `operation` 时走两级 head：
+   * action head 里每种 operation 收敛成一个代表项，具体目标落在 `target_<OP>` head。
+   */
+  offers: readonly Offer[];
   /** 从用户原话切出的候选片段，模型只能在这里面挑，不能生成。 */
   spans: readonly string[];
   /** 可作为笔记正文的来源：上一步的产物，或某个原话片段。 */
@@ -241,9 +272,43 @@ export type Decision = {
   span: string | null;
   /** 正文来源 key。null 同上。 */
   bodySource: string | null;
+  /**
+   * 模型挑中的 AX 目标 offerId。`judgement.action` 不是 `AX:<OP>` 代表项时恒为 null。
+   *
+   * 它和执行动作的 id 是同一件事的两半：action 说「用哪类能力」，targetId 说「对谁做」。
+   * 两者必须一起流到执行层，只带 action 等于「知道要点按钮，但不知道点哪个」。
+   */
+  targetId: string | null;
   /** 答案校验失败的原因；非空时 policy 会把整条判断作废。 */
   violations: string[];
 };
+
+/**
+ * action head 里 AX 代表项的前缀。
+ *
+ * 用它把「用哪类能力」和「对谁做」拆开：代表项是 `AX:CLICK` 这样的稳定键，具体 offerId
+ * 每次 observe 都变，放进 action head 会让单题的上下文随目标数量膨胀，也让概率键集
+ * 每次都不一样。冒号不在脚本动作 id（`应用.命令`）里，两类键不会撞。
+ */
+const AX_HEAD_PREFIX = "AX:";
+
+function axHeadId(op: AxOperation): string {
+  return `${AX_HEAD_PREFIX}${op}`;
+}
+
+/**
+ * 把两级 head 的答案合成执行层（policy / 重复守卫 / 适配器）只认的那**一个**动作 id。
+ *
+ * action head 给的是 `AX:<OP>` 代表项，具体对谁做在 `targetId` 里——只把 action 交出去，
+ * 等于「知道要点按钮，但不知道点哪个」；而 `AX:<OP>` 不在动作面的 id 集合里，policy 会把它
+ * 当成「未提供的选项」整条作废。选了非 AX 动作时 `targetId` 恒为 null，原样返回 action。
+ *
+ * `targetId` 为空却仍是 AX 代表项（校验应已判违规，这里只是兜底）时返回代表项本身：
+ * 它不在动作面里，于是照旧被拦下，而不是拿一个空 id 去撞后面的每一道闸。
+ */
+export function executionActionId(d: Decision): string {
+  return d.judgement.action.startsWith(AX_HEAD_PREFIX) ? (d.targetId ?? d.judgement.action) : d.judgement.action;
+}
 
 /** 概率分布的容差。和明显偏离 1 说明返回的不是一个分布，整条答案不可信。 */
 const PROB_SUM_TOLERANCE = 0.05;
@@ -336,7 +401,24 @@ export async function judge(
   const violations: string[] = [];
 
   const actionOpts: Record<string, string | null> = {};
-  for (const o of input.offers) actionOpts[o.id] = o.summary;
+  // 脚本动作与任务层动作没有 operation，直接进 action head
+  for (const o of input.offers) {
+    if (o.operation === undefined) actionOpts[o.id] = o.summary;
+  }
+
+  // 每种出现过的 operation 收敛成一个代表项，排在脚本与任务层动作之后。
+  // 同一个 operation 下的具体目标不在这里，落到下面的 target_<OP> head——
+  // 一道单选里既挑能力又挑目标，会让上下文与概率键集都随目标数量膨胀。
+  const opTargets = new Map<AxOperation, Offer[]>();
+  for (const o of input.offers) {
+    if (o.operation === undefined) continue;
+    const group = opTargets.get(o.operation);
+    if (group) group.push(o);
+    else opTargets.set(o.operation, [o]);
+  }
+  for (const [op, group] of opTargets) {
+    actionOpts[axHeadId(op)] = `AX ${op}：界面上的 ${group.length} 个可操作目标`;
+  }
 
   // 动态 head：候选只有一个时代码直接填，少问一个问题就少一条失败路径
   const askSpan = input.spans.length >= 2;
@@ -365,11 +447,23 @@ export async function judge(
     for (const b of input.bodySources) bodyOpts[b.key] = b.hint;
     questions.body = choice("要写进备忘录的内容应该取自哪里？", bodyOpts);
   }
+  // 每个 operation 一个 target head。单候选的那一类不问——代码直接采用，
+  // 少问一题就少一条失败路径，与 span / body 的处理是同一条理由。
+  const singleTarget = new Map<AxOperation, string>();
+  for (const [op, group] of opTargets) {
+    if (group.length === 1) {
+      singleTarget.set(op, group[0].id);
+      continue;
+    }
+    const targetOpts: Record<string, string | null> = {};
+    for (const o of group) targetOpts[o.id] = o.summary;
+    questions[`target_${op}`] = choice(`要在界面上操作哪一个目标？（${op}）`, targetOpts);
+  }
 
   const r = await callModel(
     (s) =>
       client.systemOne(
-        { state: richState(input), questions: questions as never },
+        { model: JEV_MODEL, state: richState(input), questions: questions as never },
         { signal: s, timeout: MODEL_TIMEOUT_MS, retry: NO_SDK_RETRY },
       ),
     signal,
@@ -384,7 +478,7 @@ export async function judge(
         action: "none", probabilities: {}, confidence: 0, complete: 0, destructive: 1,
         backend: "jev", latency_ms,
       },
-      span: null, bodySource: null,
+      span: null, bodySource: null, targetId: null,
       violations: ["模型没有返回 action 答案"],
     };
   }
@@ -420,6 +514,37 @@ export async function judge(
     bodySource = input.bodySources[0].key;
   }
 
+  // 只有被选中的那个 operation 的 target head 参与校验。
+  //
+  // 没被选中的 head，模型在里面写什么都与我们无关：我们只问了「AX:CLICK 这一类」里的目标，
+  // 它顺手在 target_OPEN 里编个 id，既不影响这次执行，也不说明它误解了我们给的动作面。
+  // 反过来把它也算成违规，等于让一个不影响结果的分支把整条判断作废——
+  // 那是把校验装错了位置。校验只该盯住「真的会变成动作」的那一个答案。
+  let targetId: string | null = null;
+  const selectedOp = action.choice.startsWith(AX_HEAD_PREFIX)
+    ? (action.choice.slice(AX_HEAD_PREFIX.length) as AxOperation)
+    : null;
+  if (selectedOp !== null && opTargets.has(selectedOp)) {
+    const sole = singleTarget.get(selectedOp);
+    if (sole !== undefined) {
+      // 单候选那一问没被发出，代码直接采用——与 span / body 的单候选路径同一条逻辑
+      targetId = sole;
+    } else {
+      const group = opTargets.get(selectedOp)!;
+      const key = `target_${selectedOp}`;
+      const ids = group.map((o) => o.id);
+      const picked = asChoice(answers[key]);
+      if (!picked) {
+        violations.push(`模型没有返回 ${key} 答案`);
+      } else if (!ids.includes(picked.choice)) {
+        violations.push(`模型返回了未提供的目标 ${JSON.stringify(picked.choice)}`);
+      } else {
+        targetId = picked.choice;
+        checkDistribution(key, picked.probabilities, violations, ids, picked.choice);
+      }
+    }
+  }
+
   return {
     judgement: {
       action: action.choice,
@@ -433,6 +558,7 @@ export async function judge(
     },
     span,
     bodySource,
+    targetId,
     violations,
   };
 }

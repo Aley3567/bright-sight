@@ -21,9 +21,10 @@ enum CoreProtocol {
   static let replayedField = "replayed"
 
   static let methodSessionHandle = "session.handle"
-  static let methodSessionDescribe = "session.describe"
   static let methodSessionConfirm = "session.confirm"
   static let methodSessionCancel = "session.cancel"
+  static let methodAXObserve = "ax.observe"
+  static let methodAXPerform = "ax.perform"
   static let notifyServerReady = "server.ready"
   static let notifyTransportError = "transport.error"
 

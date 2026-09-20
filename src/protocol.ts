@@ -1,14 +1,17 @@
 /**
- * Swift ↔ Node 那条线的**唯一**定义。
+ * Swift ↔ Node 那条线的**人读契约**。
  *
  * 之所以单独成文件而不是散在 rpc.ts 里：另一侧是 Swift，它不 import TypeScript。
- * Swift 侧的实现者只会读这一个文件，所以凡是「线上出现过的东西」都必须在这里写全，
- * 反过来这里也不放任何实现细节——帧怎么切、id 怎么配对在 rpc.ts，会话怎么跑在 session.ts。
+ * 凡是「线上出现过的东西」都必须在这里写全，反过来这里也不放任何实现细节——
+ * 帧怎么切、id 怎么配对在 rpc.ts，会话怎么跑在 session.ts。
+ * Swift 侧是手抄影子 `CoreProtocol.swift`，不是生成物，会漂移；对齐靠平行测试，
+ * 没有 codegen。行上限这里按字符、Swift 按字节；未知 error code 两侧缺省也不同。
  *
  * ── 为什么是 JSON Lines over stdio ──
- * 原先是一次性 spawn + 解析中文文本 stdout（`CommandExecutor.swift` 里靠 `contains("结果: done")`
- * 认结局）。那条通道只能单向、只能一问一答，而 AX 遍历必须留在 Swift（元素引用要跨步骤保活），
- * 决策必须留在 Node。一旦「Node 决策到一半反过来要求 Swift 去观察」，文本 stdout 就无解了。
+ * 原先是一次性 spawn `bright-sight run` + 解析中文文本 stdout 认结局。那条通道只能单向、
+ * 只能一问一答，而 AX 遍历必须留在 Swift（元素引用要跨步骤保活），决策必须留在 Node。
+ * 一旦「Node 决策到一半反过来要求 Swift 去观察」，文本 stdout 就无解了。
+ * 生产路径已经换成这条线：`CommandExecutor.swift` 只调 `session.handle`，不再 parse CLI stdout。
  *
  * ── 四种消息 ──
  * 每行一个 JSON 对象，两个方向对称，谁都可以发请求：
@@ -48,8 +51,7 @@
  * 新增字段前先回答这个问题，答不上来就不要加。
  */
 
-import type { ScriptEffect } from "./scripts.ts";
-import type { ActionSpec, RunStatus } from "./types.ts";
+import type { ActionSpec, CapabilityEffect, RunStatus } from "./types.ts";
 
 /** 协议版本。`server.ready` 里报一次，对不上说明 core 与 App 不是一次构建出来的。 */
 export const PROTOCOL_VERSION = 1;
@@ -276,8 +278,9 @@ export const METHOD_SESSION_HANDLE = "session.handle";
 export const METHOD_SESSION_DESCRIBE = "session.describe";
 
 /**
- * 阶段 3 的两个方法。**核心侧已实现并注册**（`session.ts:426`、`:435`，经 `cli.ts:203` 的
- * `makeSessionMethods` 进入 serve），Swift 侧由阶段 3.3 的确认气泡调用。
+ * `session.confirm` / `session.cancel`。**核心侧已实现并注册**（`session.ts` 的
+ * `makeSessionMethods`，经 `cli.ts` 的 `cmdServe` 进入 serve），Swift 确认气泡调用它们。
+ * 常量名仍叫 `RESERVED_CLIENT_METHODS` 是历史包袱，不是「尚未实现」。
  *
  * 形状钉在这里，让核心、Swift bridge 与 UI 共用同一份 wire 约定：
  *
@@ -314,15 +317,16 @@ export type SessionHandleParams = {
 
 export type SessionDescribeParams = Record<string, never>;
 
-// ── Node → Swift 的方法（阶段 4，现在没有实现） ──────────────────────────────
+// ── Node → Swift 的 AX 方法 ───────────────────────────────────────────────────
 
 /**
- * AX 能力层的两个反向调用。**阶段 4 才实现**，现在只占位。
+ * AX 能力层的两个反向调用。类型化调用与 fail-closed 响应校验在 `src/ax.ts`，
+ * Swift 的真实实现位于 `apps/macos/Sources/BrightSightVoice/AX/`。
  *
  * 位置留在这里的意义是：反向通道的机制（rpc.ts 的 `call`）这一轮已经能用且有测试，
  * 阶段 4 只需要在 Swift 侧注册这两个方法名，不必再动协议骨架。
  *
- *   ax.observe  `{scope: "focusedWindow" | "application", pid?: number}`
+ *   ax.observe  `{scope: "focusedWindow" | "application", pid?: number, offset?: number, pageSize?: number}`
  *               → `{frameId, offers: ActionOffer[], truncated?: {reason, depth, nodes, ms}}`
  *   ax.perform  `{frameId, offerId, operation, value?}`
  *               → `{status: "executed" | "rejected_stale" | "failed" | "effect_unknown", …}`
@@ -333,18 +337,18 @@ export type SessionDescribeParams = Record<string, never>;
  *   - `offerId` 只在它所属的那个 frame 里有效。换了 frame 就作废，这是 freshness guard
  *     的协议侧一半，另一半是 Swift 执行前按属性指纹复验目标身份。
  */
-export const RESERVED_SERVER_METHODS = ["ax.observe", "ax.perform"] as const;
+export const AX_SERVER_METHODS = ["ax.observe", "ax.perform"] as const;
 
 // ── session.handle 的结果 ────────────────────────────────────────────────────
 
 /**
  * 一次 handle 的结局。
  *
- * `waiting_for_confirmation` **阶段 3 才会出现**，但 Swift 现在就要有这个分支：
- * 等它真的出现时才加分支，中间这段时间里它会静默落进 default，
- * 表现为「点了确认没反应」——那正是最难查的一类缺陷。
+ * `waiting_for_confirmation` 已经会作为 `session.handle` 的 result 出现
+ * （policy 要人拍板、且带真实 `actionId` 时）。Swift 必须有这个分支：缺了会静默落进
+ * default，表现为「点了确认没反应」。
  *
- * `docs/agent-v2-design.md` §3.1 的 SessionStatus 有七个态，这里只有四个：
+ * 设计文档早先草拟的 SessionStatus 有七个态，线上只有四个：
  * `idle` / `running` / `paused` 描述的是 Session 自己的生命周期，不是一次 handle 的回答，
  * 它们永远不会作为 `session.handle` 的 result 出现。
  */
@@ -354,8 +358,8 @@ export type SessionStatus = "done" | "blocked" | "needs_input" | "waiting_for_co
  * 结局的机器可读分类。
  *
  * 分工是死的：**code 决定 UI 走哪条分支，detail 决定 UI 显示什么字。**
- * 别去 match detail 的中文——`CommandExecutor.swift` 现在正是这么干的
- * （`contains("终止意图 UNSUPPORTED")`），改一句文案就静默失效。
+ * 别去 match detail 的中文。旧的 spawn+`contains("终止意图 UNSUPPORTED")` 路径已经不在；
+ * `CoreOutcomeSummary.swift` 按 `reasons[].code` 分支。改一句文案不该让 UI 走错。
  *
  * 粒度说明（这是当前的真实能力边界，不是设计偏好）：code 由 `RunState` 的结构推导，
  * 而 `policy.ts` / `loop.ts` 目前只产出人读的 `reasons: string[]`，没有自己的 code。
@@ -396,7 +400,7 @@ export type SessionReason = {
   step?: number;
 };
 
-export type CapabilityEffect = ScriptEffect;
+export type { CapabilityEffect } from "./types.ts";
 export type CapabilityRisk = ActionSpec["risk"];
 
 /**
@@ -482,7 +486,9 @@ export type SessionDescription = {
 type Exactly<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
 type Assert<T extends true> = T;
 
-type _EffectInSync = Assert<Exactly<CapabilityEffect, ScriptEffect>>;
+// 不再有 _EffectInSync：能力词表现在由 types.ts 唯一地定义，协议直接 re-export 它，
+// 两侧无从漂移。它此前会漂，是因为脚本侧另有一套词表（create/navigate/read/destroy），
+// 两套词表在 5.3 已统一——留着那条断言只会钉住一个已经不存在的分叉。
 type _RiskInSync = Assert<Exactly<CapabilityRisk, ActionSpec["risk"]>>;
 /** `RunStatus` 的四个值里，`running` 不是一次 handle 的合法结局，其余三个必须都在 SessionStatus 里。 */
 type _StatusCovered = Assert<Exclude<RunStatus, "running"> extends SessionStatus ? true : false>;

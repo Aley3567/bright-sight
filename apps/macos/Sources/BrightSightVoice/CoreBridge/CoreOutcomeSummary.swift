@@ -25,15 +25,44 @@ enum CoreOutcomeSummary {
         visualSummary: "这条指令刚才已经执行过，没有重复执行。\(visual)",
         spokenSummary: nil,
         disposition: disposition,
-        confirmation: confirmation
+        confirmation: confirmation,
+        steps: steps(for: update)
       )
     }
     return CommandOutcome(
       visualSummary: visual,
       spokenSummary: spokenText(for: update, disposition: disposition),
       disposition: disposition,
-      confirmation: confirmation
+      confirmation: confirmation,
+      steps: steps(for: update)
     )
+  }
+
+  /// 只收真发出去过的步骤。
+  ///
+  /// 没执行的那些（含终止意图 `DONE`，它的 executed 恒为 false）不进清单：这张清单回答的是
+  /// 「已经动过什么」，不是「打算做什么」。按 executed 过滤同时免掉了对 DONE 这个字面量的硬编码。
+  private static func steps(for update: CoreSessionUpdate) -> [CommandStep] {
+    update.steps.filter(\.executed).map { step in
+      let state: CommandStep.State
+      switch step.verified {
+      case .some(true): state = .verified
+      case .some(false): state = .failed
+      // 缺省落在「未验证」而不是「完成」：说成完成是这里唯一不可接受的错
+      case .none: state = .unverified
+      }
+      return CommandStep(
+        app: appName(ofAction: step.actionId, capabilities: update.capabilities) ?? step.actionId,
+        command: commandName(ofAction: step.actionId),
+        state: state
+      )
+    }
+  }
+
+  /// 动作 id 的 `app.command` 后半段。没有点号时整串就是命令名。
+  private static func commandName(ofAction actionId: String) -> String {
+    guard let dot = actionId.lastIndex(of: ".") else { return actionId }
+    return String(actionId[actionId.index(after: dot)...])
   }
 
   private static func disposition(

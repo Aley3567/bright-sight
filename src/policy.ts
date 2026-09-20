@@ -59,7 +59,7 @@ export type PolicyInput = {
 };
 
 /**
- * 三道独立硬闸，取或。
+ * 四道独立硬闸，取或。
  *
  * 代码里不存在任何路径让模型的概率**降低**拦截强度——模型的 destructive
  * 只能把 safe 的动作抬进 confirm，不能把 destructive 的动作放行。
@@ -76,6 +76,16 @@ function hardBlocked(input: PolicyInput): string[] {
   }
   // 第三道：模板自带，抓 sdef 误标——sdef 的动词名不足以判断后果，模板作者知道
   if (template?.effect === "destroy") hits.push(`模板 ${template.id} 声明了破坏性副作用`);
+  // 第四道：AX 动作的写档一律要人拍板。
+  //
+  // AX 动作没有模板，第三道对它恒不触发；而它的 risk 是 Node 自算出来的兜底档
+  // （认不出的组合固定是 change/caution），拿它当唯一判据等于「认得出才拦、认不出就放行」。
+  // 所以这里直接按 effect 判档，不绕道 risk：change/submit/destroy 都是会改变
+  // 用户界面的动作，即便是「受控窗口」也不自动执行——这是刻意的选择，接通之后
+  // 点任何按钮都要人点头。
+  if (spec?.kind === "ax" && (spec.effect === "change" || spec.effect === "submit" || spec.effect === "destroy")) {
+    hits.push(`AX 动作 ${spec.id} 会改动界面（${spec.effect}），需要当场确认`);
+  }
   return hits;
 }
 
@@ -124,8 +134,26 @@ export function policy(input: PolicyInput): PolicyResult {
     return { kind: "wait", actionId: null, reasons: [`指令完整度 ${j.complete.toFixed(2)} 低于 ${THRESHOLDS.complete}`] };
   }
 
-  // 白名单与模板各查一次，两个条件独立：surface 放错了，这里仍然拦得住
   if (!spec) return { kind: "ignore", actionId: id, reasons: [`动作面里没有 ${id}`] };
+
+  // 按 kind 分流，没有第三支兜底放行。两类动作的判据依据不同的表：
+  // 脚本动作问「在不在执行白名单、有没有冻结模板、会落在哪个 Chrome profile」，
+  // 这三个问题对 AX 动作要么恒真要么无意义（AX 不发 Apple Event，也不认 Chrome profile 这个概念）。
+  // 缺省值一律 fail-closed：这里没有 `else` 放行的写法，两个分支各自必须给出结论。
+  if (spec.kind === "ax") {
+    // AX 判据只有「该不该做」这一问，静态档已经由 hardBlocked 的第四道闸拦过。
+    // 剩下的判据与脚本动作共用同一个置信度门槛。
+    if (j.confidence < THRESHOLDS.execute) {
+      return { kind: "ask", actionId: id, reasons: [`置信度 ${j.confidence.toFixed(2)} 低于 ${THRESHOLDS.execute}，先问清楚`] };
+    }
+    return {
+      kind: "execute",
+      actionId: id,
+      reasons: [`置信度 ${j.confidence.toFixed(2)}、完整度 ${j.complete.toFixed(2)}，AX 动作 ${spec.operation}`],
+    };
+  }
+
+  // 白名单与模板各查一次，两个条件独立：surface 放错了，这里仍然拦得住
   if (!isAllowedApp(spec.app)) {
     return { kind: "ignore", actionId: id, reasons: [`${spec.app} 不在执行白名单内`] };
   }
@@ -140,6 +168,9 @@ export function policy(input: PolicyInput): PolicyResult {
   // 第四道闸放在最后：前面几道回答「这件事该不该做」，这一道回答「在谁的登录态里做」。
   // 顺序反过来的话，一个置信度过低的动作会先因为 profile 被问成 confirm，
   // 人看到的提示就成了「要不要在某某 profile 下执行」，而真正的问题是模型根本没想清楚。
+  //
+  // 它只对脚本动作生效：profile 是「这次 Apple Event 会落到哪个 Chrome profile」，
+  // AX 路径根本不发 Apple Event，套上它只会让 AX 动作凭空多出一大片确认气泡。
   const gate = profileBlock(spec.app, input.profile);
   if (gate) return { kind: "confirm", actionId: id, reasons: [gate] };
 

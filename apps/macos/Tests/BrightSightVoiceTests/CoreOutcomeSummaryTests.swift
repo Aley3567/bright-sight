@@ -147,4 +147,79 @@ final class CoreOutcomeSummaryTests: XCTestCase {
     XCTAssertTrue(outcome.visualSummary.contains("演练"))
     XCTAssertFalse(outcome.visualSummary.contains("已完成Notes操作"))
   }
+
+  /// 四种分支在同一次 update 里同时命中。
+  ///
+  /// 只测顺风路径的话，「判据装错了位置」「把不该管的也管了」这两类缺陷会全绿通过——
+  /// 比如把过滤条件写成 `verified != nil`，单独测每一条都还是对的。
+  func testStepListSeparatesVerifiedUnverifiedFailedAndNeverRun() {
+    let outcome = CoreOutcomeSummary.outcome(for: CoreSessionUpdate(
+      status: .done,
+      reasons: [CoreReason(code: .completed, detail: "做完了")],
+      steps: [
+        CoreSessionStep(step: 1, actionId: "Google Chrome.make-tab", executed: true, verified: true),
+        CoreSessionStep(step: 2, actionId: "Notes.make-note", executed: true, verified: nil),
+        CoreSessionStep(step: 3, actionId: "Notes.append-note", executed: true, verified: false),
+        CoreSessionStep(step: 4, actionId: "DONE", executed: false, verified: nil),
+      ]
+    ))
+
+    XCTAssertEqual(outcome.steps.count, 3, "没执行过的步骤（含终止意图 DONE）不进「已经动过什么」这张清单")
+    XCTAssertEqual(outcome.steps.map(\.state), [.verified, .unverified, .failed])
+    XCTAssertEqual(outcome.steps.map(\.app), ["Google Chrome", "Notes", "Notes"])
+    XCTAssertEqual(outcome.steps.map(\.command), ["make-tab", "make-note", "append-note"])
+  }
+
+  /// `verified` 的 null 是三态里唯一能把人骗了的那个。
+  func testUnverifiedStepIsNeverShownAsVerified() {
+    let outcome = CoreOutcomeSummary.outcome(for: CoreSessionUpdate(
+      status: .done,
+      reasons: [CoreReason(code: .doneUnverified, detail: "动作发出去了，但没能回读")],
+      steps: [CoreSessionStep(step: 1, actionId: "Notes.make-note", executed: true, verified: nil)]
+    ))
+    XCTAssertEqual(outcome.steps.map(\.state), [.unverified])
+    XCTAssertNotEqual(outcome.steps.first?.state, .verified, "null 不是「验证过」")
+    XCTAssertNotEqual(outcome.steps.first?.state, .failed, "null 也不是「验证没过」——是没有可核对的东西")
+  }
+
+  /// 失败时这张清单更不能空：副作用可能已经发生了一半。
+  func testFailedOutcomeStillCarriesWhatWasAlreadyDone() {
+    let outcome = CoreOutcomeSummary.outcome(for: CoreSessionUpdate(
+      status: .blocked,
+      reasons: [CoreReason(code: .verifyFailed, detail: "第 2 步回读对不上")],
+      steps: [
+        CoreSessionStep(step: 1, actionId: "Google Chrome.make-tab", executed: true, verified: true),
+        CoreSessionStep(step: 2, actionId: "Notes.make-note", executed: true, verified: false),
+      ]
+    ))
+    XCTAssertEqual(outcome.disposition, .unfinished)
+    XCTAssertEqual(outcome.steps.count, 2, "没做成不等于什么都没发生")
+    XCTAssertEqual(outcome.steps.map(\.state), [.verified, .failed])
+  }
+
+  /// 应用名优先取 capabilities 给的，没有才退回 id 前缀——和 completedText 用的是同一条规则。
+  func testStepAppNamePrefersCapabilityOverIdPrefix() {
+    let outcome = CoreOutcomeSummary.outcome(for: CoreSessionUpdate(
+      status: .done,
+      reasons: [CoreReason(code: .completed, detail: "做完了")],
+      steps: [CoreSessionStep(step: 1, actionId: "com.example.thing.do-it", executed: true, verified: true)],
+      capabilities: [CoreCapability(id: "com.example.thing.do-it", app: "某个应用", summary: "做一件事")]
+    ))
+    XCTAssertEqual(outcome.steps.first?.app, "某个应用")
+    XCTAssertEqual(outcome.steps.first?.command, "do-it", "命令名始终取最后一段，不受 capabilities 影响")
+  }
+
+  /// 拆不出应用名时退回整串而不是空字符串。
+  ///
+  /// 实际到不了这里（动作 id 由动作面按 `app.command` 生成，没有点号的只有 DONE/ASK 这类
+  /// 终止意图，而它们 executed=false 早被滤掉了）。记录下来是为了钉住「宁可重复也不显示空」。
+  func testActionIdWithoutDotFallsBackToWholeString() {
+    let outcome = CoreOutcomeSummary.outcome(for: CoreSessionUpdate(
+      status: .done,
+      reasons: [CoreReason(code: .completed, detail: "做完了")],
+      steps: [CoreSessionStep(step: 1, actionId: "standalone", executed: true, verified: true)]
+    ))
+    XCTAssertEqual(outcome.steps.first?.app, "standalone")
+    XCTAssertEqual(outcome.steps.first?.command, "standalone")
+  }
 }

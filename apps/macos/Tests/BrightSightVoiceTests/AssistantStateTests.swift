@@ -75,4 +75,42 @@ final class AssistantStateTests: XCTestCase {
     XCTAssertNil(state.confirmation)
     XCTAssertFalse(state.isAnsweringConfirmation)
   }
+
+  func testPushLevelSlidesTheWindowLeftAndKeepsItFixedLength() {
+    var state = AssistantState()
+    let window = AssistantState.levelWindow
+    XCTAssertEqual(state.levels.count, window)
+
+    for index in 1...window {
+      state.pushLevel(Float(index) / Float(window))
+    }
+    XCTAssertEqual(state.levels.count, window, "定长滚动窗口，不能越推越长")
+    XCTAssertEqual(state.levels.last ?? 0, 1, accuracy: 0.001, "最新采样落在右端")
+    XCTAssertEqual(state.levels.first ?? 0, 1 / Float(window), accuracy: 0.001, "最旧的那个已经被挤出去了")
+  }
+
+  func testPushLevelClampsAndKeepsAudioLevelInSync() {
+    var state = AssistantState()
+    state.pushLevel(2)
+    XCTAssertEqual(state.levels.last, 1)
+    XCTAssertEqual(state.audioLevel, 1, "两个字段读的是同一个采样，不能各说各话")
+
+    state.pushLevel(-1)
+    XCTAssertEqual(state.levels.last, 0)
+    XCTAssertEqual(state.audioLevel, 0)
+  }
+
+  /// 新一轮开始时波形要清零，否则上一句的余波会挂在那里冒充「正在听到声音」。
+  func testStartingANewRoundClearsThePreviousWaveform() {
+    var state = AssistantState()
+    state.pushLevel(0.9)
+
+    state.beginAuthorization()
+    XCTAssertTrue(state.levels.allSatisfy { $0 == 0 }, "开始录音前残留的余波会骗人")
+
+    state.pushLevel(0.9)
+    state.beginWorking(command: "打开备忘录", source: .voice)
+    XCTAssertTrue(state.levels.allSatisfy { $0 == 0 })
+    XCTAssertTrue(state.steps.isEmpty, "新一轮不该带着上一轮的步骤")
+  }
 }

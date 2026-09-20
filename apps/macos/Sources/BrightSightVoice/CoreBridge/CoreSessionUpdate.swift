@@ -33,8 +33,9 @@ enum CoreSessionStatus: Equatable, Sendable {
 
 /// 结局的机器可读分类。**code 决定走哪条分支，detail 决定显示什么字。**
 ///
-/// 不要去 match detail 的中文：改版之前这里正是靠 `contains("终止意图 UNSUPPORTED")` 判的，
-/// 核心那边改一句文案就静默失效，而且失效的方向是「什么都没发生，但界面说做完了」。
+/// 不要去 match detail 的中文。旧路径靠 `contains("终止意图 UNSUPPORTED")` 判结局，
+/// 核心改一句文案就静默失效，而且失效的方向是「什么都没发生，但界面说做完了」。
+/// 那条 spawn+parse stdout 的路已经不在；这里按 `reasons[].code` 分支。
 enum CoreReasonCode: Equatable, Sendable {
   case completed
   case unsupported
