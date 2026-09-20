@@ -66,4 +66,3 @@
 - 为什么这样设计：看 [design.md](design.md)
 - 怎么跑测试、怎么加新动作：看 [CONTRIBUTING.md](../CONTRIBUTING.md)
 - AppleScript 的坑：看 `src/scripts.ts` 文件头
-

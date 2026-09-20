@@ -141,4 +141,3 @@ test("journal 只提供结构化证据；定时授权必须精确匹配且永不
   assert.equal(authorizeScheduled({ ...grant, target: "other" }, grant).allowed, false);
   assert.equal(authorizeScheduled({ ...grant, effect: "destroy" }, grant).allowed, false);
 });
-

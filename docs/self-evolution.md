@@ -94,4 +94,3 @@ bright-sight memory 恢复 <id>
 - `destroy` 永远拒绝。
 
 真正的 schedule 仍须在相应阶段复用现有 Policy 和 verify；本模块不会创建第二条执行路径。
-

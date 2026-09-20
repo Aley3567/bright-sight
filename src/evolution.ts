@@ -441,4 +441,3 @@ export function authorizeScheduled(request: ScheduledRequest, grant?: ScheduledA
     ? { allowed: true, reason: "技能版本、目标、输入与验证条件完全匹配" }
     : { allowed: false, reason: "预授权与当前技能版本、目标、输入或验证条件不一致" };
 }
-
