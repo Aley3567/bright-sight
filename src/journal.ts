@@ -46,8 +46,14 @@ export type JournalEvent = {
   at: string;
   runId: string;
   step: number;
-  /** 四步闭环里的哪一步，或 run 级别的开始/结束。 */
-  phase: "run.start" | "observe" | "judge" | "act" | "verify" | "run.end";
+  /**
+   * 四步闭环里的哪一步，或 run 级别的开始/结束。
+   *
+   * `suspend` / `resume` 是等人确认的那一对。它们不是第五步——挂起与恢复落在**同一个** step 上，
+   * 中间隔着一段人的时间。一条 run 因此可能出现两条 `run.end`：挂起时一条
+   * （等不到回答的 run 也必须有结局），恢复跑完再一条。
+   */
+  phase: "run.start" | "observe" | "judge" | "act" | "verify" | "suspend" | "resume" | "run.end";
   /**
    * 这条事件的 data 是否经过脱敏。
    *

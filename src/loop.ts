@@ -1,12 +1,13 @@
+import { randomUUID } from "node:crypto";
 import { LIMITS } from "./config.ts";
 import type { BodySource, Decision, JudgeInput } from "./decide.ts";
 import { ARTIFACT_PREFIX, SPAN_SOURCE, resolveArgs, type ExecContext, type ExecOutcome } from "./execute.ts";
-import { policy, type PolicyResult } from "./policy.ts";
+import { freshnessMark, policy, staleness, type PolicyResult } from "./policy.ts";
 import { REGISTRY } from "./scripts.ts";
 import { extractSpans } from "./spans.ts";
 import type { OfferSet } from "./surface.ts";
 import { probeIdFor, type Probe, type VerifyInput } from "./verify.ts";
-import { isTaskAction, type Artifact, type ProfileGate, type RunState, type Snapshot, type StepRecord, type VerifyResult } from "./types.ts";
+import { isTaskAction, type Artifact, type PendingConfirmation, type ProfileGate, type RunState, type Snapshot, type StepRecord, type VerifyResult } from "./types.ts";
 
 /**
  * 四步闭环的编排：observe → judge → act → verify，反复直到收手。
@@ -17,6 +18,12 @@ import { isTaskAction, type Artifact, type ProfileGate, type RunState, type Snap
  *
  * 所有依赖都是函数参数。测试注入假 backend 和假 executor 就能把整个控制流
  * 跑完，不碰网络也不碰应用——这比 mock 框架直白，也不会在重构时悄悄失效。
+ *
+ * ── 两条恢复路径，别把它们混成一条 ──
+ * 机器自己恢复：验证失败 → 重新观察 → 模型改走别的动作（`maxRecoveries`）。不问人。
+ * 人来拍板：policy 要求确认 → 挂起（`waiting_for_confirmation`）→ `resumeLoop` 从那一步继续。
+ * 前者是「这条路走不通」，后者是「这条路要不要走」。两者会在同一次 run 里交替出现，
+ * 所以恢复预算原样穿过挂起：等人回答不是一次失败，取消也不是。
  */
 
 export type LoopDeps = {
@@ -27,7 +34,7 @@ export type LoopDeps = {
   checkStep: (input: VerifyInput) => Promise<VerifyResult>;
   /** 留痕，失败不影响主流程。 */
   record?: (
-    phase: "run.start" | "observe" | "judge" | "act" | "verify" | "run.end",
+    phase: "run.start" | "observe" | "judge" | "act" | "verify" | "suspend" | "resume" | "run.end",
     step: number,
     data: unknown,
   ) => Promise<void>;
@@ -39,12 +46,28 @@ export type LoopOptions = {
   /** 连续 WAIT 的容忍次数。超过说明模型在原地打转，不是真的在等。 */
   maxConsecutiveWaits?: number;
   /**
+   * 验证失败后允许重新观察并改走其他路径的次数。
+   *
+   * 失败动作仍留在 proposed 集合里，因此这不是自动重放副作用；模型只能根据
+   * 新快照选择另一条动作，或明确收手。超过预算才真正 blocked。
+   */
+  maxRecoveries?: number;
+  /**
    * Chrome profile 闸门状态，原样透传给 policy。
    *
    * loop 不探测也不解释它——探测要读磁盘，而 loop 的全部依赖都是函数参数，
    * 这是它能被纯内存测试跑完整个控制流的原因。
+   *
+   * **恢复时必须重新探测后再传进来。** 沿用挂起那一刻的值等于跳过 freshness 检查。
    */
   profile?: ProfileGate;
+  /**
+   * 铸一个 confirmId。可注入只为让测试拿到确定性，与 `journal.ts` 的 `ulid` 同一个路数。
+   *
+   * 默认走 `randomUUID`：它不是「依赖」，是取一个不可预测的值，
+   * 没有它就只能用步数之类可预测的东西当 id，而那样的 id 挡不住重放。
+   */
+  mintConfirmId?: () => string;
 };
 
 /** 产物值可能很长（网页标题、URL），给模型看摘要就够，完整值只在代码里流转。 */
@@ -82,10 +105,36 @@ function summarize(rec: StepRecord): string {
 }
 
 /**
+ * 一次 run 里会被跨步骤改写的那些量。
+ *
+ * 做成一个对象而不是散落的局部变量，是为了让挂起能把它们整份存下来、恢复能整份装回去。
+ * 少带一个，恢复出来的就是一个预算被悄悄清零的 run。
+ */
+type Runtime = {
+  state: RunState;
+  proposed: Set<string>;
+  waits: number;
+  recoveries: number;
+  unresolvedFailure: boolean;
+};
+
+type Limits = { maxSteps: number; maxWaits: number; maxRecoveries: number };
+
+function limitsOf(opts: LoopOptions): Limits {
+  return {
+    maxSteps: opts.maxSteps ?? LIMITS.maxSteps,
+    maxWaits: opts.maxConsecutiveWaits ?? 2,
+    maxRecoveries: opts.maxRecoveries ?? 2,
+  };
+}
+
+/**
  * 记一条 run.start、跑完、再记一条 run.end。
  *
  * 包在外面而不是散进 runSteps 的每个 return：那里有七条返回路径，
- * 漏掉任何一条都会让留痕里出现一条永远没有结局的 run。
+ * 漏掉任何一条都会让留痕里出现一条永远没有结局的 run。挂起也算一种结局，
+ * 所以 `waiting_for_confirmation` 同样落 run.end——一条等着人回答的 run
+ * 可能永远等不到回答，留痕不能因此停在半截。恢复是另一段，它自己再落一条。
  */
 export async function runLoop(
   utterance: string,
@@ -100,12 +149,38 @@ export async function runLoop(
     profile: opts.profile?.kind ?? "absent",
   });
   const state = await runSteps(utterance, offerSet, deps, opts);
-  await deps.record?.("run.end", state.steps.length, {
+  await endRun(state, deps);
+  return state;
+}
+
+/**
+ * 从挂起处继续，**不把历史重新解释成一条新命令**。
+ *
+ * `offerSet` 由调用方传回同一套：换一套动作面，那个待确认动作的 spec 与 risk 都可能变了，
+ * 于是人批准的和即将执行的就不是同一件事。
+ *
+ * `approved === false`（用户取消）不是一次失败：它既不消耗恢复预算，也不改 `unresolvedFailure`，
+ * 只是让这条 run 就地收手。理由是取消之后继续循环的话，模型多半会再提议同一个动作，
+ * 气泡就会反复弹——把人训练成闭眼点「确认」，那比不问还危险。
+ */
+export async function resumeLoop(
+  state: RunState,
+  offerSet: OfferSet,
+  approved: boolean,
+  deps: LoopDeps,
+  opts: LoopOptions = {},
+): Promise<RunState> {
+  const out = await resumeSteps(state, offerSet, approved, deps, opts);
+  await endRun(out, deps);
+  return out;
+}
+
+function endRun(state: RunState, deps: LoopDeps): Promise<void> | undefined {
+  return deps.record?.("run.end", state.steps.length, {
     status: state.status,
     steps: state.steps.length,
     artifacts: state.artifacts.length,
   });
-  return state;
 }
 
 async function runSteps(
@@ -114,23 +189,119 @@ async function runSteps(
   deps: LoopDeps,
   opts: LoopOptions,
 ): Promise<RunState> {
-  const maxSteps = opts.maxSteps ?? LIMITS.maxSteps;
-  const maxWaits = opts.maxConsecutiveWaits ?? 2;
-  const state: RunState = { runId: opts.runId ?? "", utterance, status: "running", steps: [], artifacts: [] };
+  const rt: Runtime = {
+    state: { runId: opts.runId ?? "", utterance, status: "running", steps: [], artifacts: [] },
+    proposed: new Set<string>(),
+    waits: 0,
+    recoveries: 0,
+    unresolvedFailure: false,
+  };
+  await drive(rt, 1, offerSet, deps, opts, limitsOf(opts));
+  return rt.state;
+}
 
-  const proposed = new Set<string>();
-  let waits = 0;
+async function resumeSteps(
+  state: RunState,
+  offerSet: OfferSet,
+  approved: boolean,
+  deps: LoopDeps,
+  opts: LoopOptions,
+): Promise<RunState> {
+  const pending = state.pending;
+  // 没有挂起点就没有「人批准过的那一步」可执行。恢复第二次、恢复一个没挂起过的 run，
+  // 都落在这里：缺省必须等于拦住，不能因为调用方说了「同意」就去跑点什么
+  if (!pending || state.status !== "waiting_for_confirmation") {
+    state.pending = undefined;
+    state.status = "blocked";
+    return state;
+  }
+  // 早于任何 await 就把挂起点消费掉：两次 session.confirm 竞争时，
+  // 第二次进来看到的只能是上面那条已经没有 pending 的路径
+  state.pending = undefined;
+  state.status = "running";
 
-  for (let step = 1; step <= maxSteps; step++) {
+  const limits = limitsOf(opts);
+  const cp = pending.checkpoint;
+  const rt: Runtime = {
+    state,
+    proposed: new Set(cp.proposed),
+    waits: cp.waits,
+    recoveries: cp.recoveries,
+    unresolvedFailure: cp.unresolvedFailure,
+  };
+
+  // 挂起那一刻这条记录就已经在账上了（否则 UI 拿不到「卡在哪一步、为什么」）。
+  // 对不上号说明传进来的不是当初挂起的那条 run
+  const rec = state.steps.find((s) => s.step === pending.step);
+  if (!rec || rec.actionId !== pending.actionId) {
+    state.status = "blocked";
+    return state;
+  }
+
+  if (!approved) {
+    rec.reasons.push("用户取消了确认，这一步没有执行");
+    state.status = "blocked";
+    await deps.record?.("resume", pending.step, { confirmId: pending.confirmId, approved: false, stale: [] });
+    return state;
+  }
+
+  // 重新观察，而不是拿挂起时那份快照。人可能盯着气泡看了五分钟
+  const snapshot = await deps.observe();
+  await deps.record?.("observe", pending.step, { front: snapshot.front, window: snapshot.window });
+  const drift = staleness({
+    mark: cp.freshness,
+    now: freshnessMark(snapshot, opts.profile),
+    app: offerSet.specs.get(pending.actionId)?.app,
+  });
+  // observe 必须排在这条之前（先看清楚才谈得上判定），所以留痕里的顺序是 observe → resume
+  await deps.record?.("resume", pending.step, {
+    confirmId: pending.confirmId,
+    approved: true,
+    stale: drift.map((s) => s.field),
+  });
+  if (drift.length > 0) {
+    rec.reasons.push(...drift.map((s) => s.detail), "确认期间世界变了，人批准的不是现在这件事");
+    state.status = "blocked";
+    return state;
+  }
+  // 这一步实际执行时面对的是新快照，账上就该记新的那份
+  rec.observe = snapshot;
+
+  const ctx: ExecContext = { span: cp.span, bodySource: cp.bodySource, artifacts: state.artifacts };
+  const verdict = await performAction(rt, deps, limits, {
+    step: pending.step,
+    rec,
+    actionId: pending.actionId,
+    ctx,
+    recorded: true,
+  });
+  if (verdict === "stop") return state;
+  await drive(rt, pending.step + 1, offerSet, deps, opts, limits);
+  return state;
+}
+
+/** observe → judge → policy → 分支，从 `from` 步跑到步数上限。 */
+async function drive(
+  rt: Runtime,
+  from: number,
+  offerSet: OfferSet,
+  deps: LoopDeps,
+  opts: LoopOptions,
+  limits: Limits,
+): Promise<void> {
+  const { state } = rt;
+  const mint = opts.mintConfirmId ?? randomUUID;
+
+  for (let step = from; step <= limits.maxSteps; step++) {
     const snapshot = await deps.observe();
     await deps.record?.("observe", step, { front: snapshot.front, window: snapshot.window });
 
-    const spans = extractSpans(utterance);
+    const spans = extractSpans(state.utterance);
     // 先用最可能的片段构造正文候选；模型改选了别的片段，下一轮自然会跟着变
     const bodySources = bodySourcesFrom(state.artifacts, spans[0] ?? null);
 
     const decision = await deps.decide({
-      utterance,
+      utterance: state.utterance,
       snapshot,
       offers: offerSet.offers,
       spans,
@@ -168,21 +339,56 @@ async function runSteps(
     };
 
     if (p.kind === "wait") {
-      waits++;
+      rt.waits++;
       state.steps.push(rec);
-      if (waits > maxWaits) {
-        rec.reasons.push(`连续 ${waits} 次 WAIT，判定为原地打转`);
+      if (rt.waits > limits.maxWaits) {
+        rec.reasons.push(`连续 ${rt.waits} 次 WAIT，判定为原地打转`);
         state.status = "blocked";
-        return state;
+        return;
       }
       continue;
     }
-    waits = 0;
+    rt.waits = 0;
 
-    if (p.kind === "ask" || p.kind === "confirm") {
+    // confirm 却拿不出动作 id 是不该出现的组合。真出现了就当追问处理：
+    // 没有「待确认的那一步」，挂起之后也无从恢复，不如如实说信息不够
+    if (p.kind === "ask" || (p.kind === "confirm" && p.actionId === null)) {
       state.steps.push(rec);
       state.status = "needs_input";
-      return state;
+      return;
+    }
+
+    if (p.kind === "confirm" && p.actionId !== null) {
+      // 挂起而不是丢掉上下文：已执行步骤与 artifacts 留在 state 里，
+      // 待确认动作的参数与恢复预算存进 checkpoint，恢复时从这一步接着跑
+      const pending: PendingConfirmation = {
+        confirmId: mint(),
+        step,
+        actionId: p.actionId,
+        reasons: [...p.reasons],
+        checkpoint: {
+          // 待确认动作刻意**不**进 proposed：它还没执行过，先记上的话恢复时会被
+          // 重复守卫拦住自己
+          proposed: [...rt.proposed],
+          waits: rt.waits,
+          recoveries: rt.recoveries,
+          unresolvedFailure: rt.unresolvedFailure,
+          span: decision.span,
+          bodySource: decision.bodySource,
+          freshness: freshnessMark(snapshot, opts.profile),
+        },
+      };
+      state.steps.push(rec);
+      state.status = "waiting_for_confirmation";
+      state.pending = pending;
+      // 只记结构：confirmId 是本轮现铸的、actionId 是动作 id、gate 是枚举值。
+      // policy 的 reasons 不记——那串文本里可能带 Chrome profile 目录名
+      await deps.record?.("suspend", step, {
+        confirmId: pending.confirmId,
+        actionId: pending.actionId,
+        gate: opts.profile?.kind ?? "absent",
+      });
+      return;
     }
 
     if (p.kind === "ignore") {
@@ -190,77 +396,120 @@ async function runSteps(
       // 终止不信任 DONE：模型说完成了，还得每一步都验证通过才算数
       if (j.action === "DONE") {
         const executed = state.steps.filter((s) => s.exec !== null);
-        const allGreen = executed.length > 0 && executed.every((s) => s.verify?.ok === true);
-        if (allGreen) {
+        const hasVerifiedAction = executed.some((s) => s.verify?.ok === true);
+        if (hasVerifiedAction && !rt.unresolvedFailure) {
           state.status = "done";
         } else {
           state.status = "blocked";
           rec.reasons.push(
             executed.length === 0
               ? "模型声称完成，但一个动作都没有执行过"
-              : "模型声称完成，但有步骤的验证没通过",
+              : "模型声称完成，但最近的失败还没有被另一条已验证路径恢复",
           );
         }
-        return state;
+        return;
       }
       state.status = "blocked";
-      return state;
+      return;
     }
 
     // ── p.kind === "execute" ──
-    const actionId = p.actionId!;
     const ctx: ExecContext = {
       span: decision.span,
       bodySource: decision.bodySource,
       artifacts: state.artifacts,
     };
-
-    const key = guardKey(actionId, ctx);
-    if (proposed.has(key)) {
-      rec.reasons.push(`同一个动作配同一组参数被第二次提议：${key}`);
-      state.steps.push(rec);
-      state.status = "blocked";
-      return state;
-    }
-    proposed.add(key);
-
-    const probeId = probeIdFor(actionId);
-    const pre = probeId ? await deps.probe(probeId) : null;
-
-    const outcome = await deps.act(actionId, ctx, step);
-    rec.exec = outcome.result;
-    // 执行后先记录再观察：万一取快照或验证炸了，这次真实发生过的动作也不能从账上消失
-    state.steps.push(rec);
-    await deps.record?.("act", step, outcome.result);
-    state.artifacts.push(...outcome.artifacts);
-
-    // 观察与验证都可能抛：探针是另一次 Apple Event，应用随时可能没响应。
-    // 但动作已经真实发生了，异常不能把它连同整条 state 一起带走——
-    // 「执行后先记录再观察」只有在这里兜住异常时才真的成立
-    try {
-      const post = probeId ? await deps.probe(probeId) : null;
-      rec.verify = await deps.checkStep({
-        actionId,
-        exec: outcome.result,
-        rawArgv: outcome.rawArgv,
-        pre,
-        post,
-      });
-    } catch (err) {
-      const detail = err instanceof Error ? err.message : String(err);
-      rec.verify = { ok: false, checks: [{ name: "verify_crashed", ok: false, detail }] };
-    }
-    await deps.record?.("verify", step, rec.verify);
-
-    if (!rec.verify.ok) {
-      state.status = "blocked";
-      return state;
-    }
+    const verdict = await performAction(rt, deps, limits, {
+      step,
+      rec,
+      actionId: p.actionId!,
+      ctx,
+      recorded: false,
+    });
+    if (verdict === "stop") return;
   }
 
   // 走完 maxSteps 还没收手。步数上限按"最坏情况用户能接受几次误操作"定，不是按 token
   state.status = "blocked";
-  return state;
+}
+
+/**
+ * 真的把一个动作发出去，然后验证它。
+ *
+ * 抽出来是因为它有两个入口：正常循环里的 execute 分支，和人确认之后的恢复。
+ * 两条路必须共用同一段代码——重复守卫、pre/post 探针、「验证通过才入账 artifacts」
+ * 这三条要是只有一条路上有，那条没有的路就是一个静默的安全漏洞。
+ *
+ * `recorded` 说的是 `rec` 在不在 `state.steps` 里了：挂起时已经推过一次，
+ * 恢复时再推就会让同一步在账上出现两遍。
+ */
+async function performAction(
+  rt: Runtime,
+  deps: LoopDeps,
+  limits: Limits,
+  plan: { step: number; rec: StepRecord; actionId: string; ctx: ExecContext; recorded: boolean },
+): Promise<"continue" | "stop"> {
+  const { state } = rt;
+  const { step, rec, actionId, ctx } = plan;
+  const push = () => {
+    if (!plan.recorded) state.steps.push(rec);
+    plan.recorded = true;
+  };
+
+  const key = guardKey(actionId, ctx);
+  if (rt.proposed.has(key)) {
+    rec.reasons.push(`同一个动作配同一组参数被第二次提议：${key}`);
+    push();
+    state.status = "blocked";
+    return "stop";
+  }
+  rt.proposed.add(key);
+
+  const probeId = probeIdFor(actionId);
+  const pre = probeId ? await deps.probe(probeId) : null;
+
+  const outcome = await deps.act(actionId, ctx, step);
+  rec.exec = outcome.result;
+  // 执行后先记录再观察：万一取快照或验证炸了，这次真实发生过的动作也不能从账上消失
+  push();
+  await deps.record?.("act", step, outcome.result);
+
+  // 观察与验证都可能抛：探针是另一次 Apple Event，应用随时可能没响应。
+  // 但动作已经真实发生了，异常不能把它连同整条 state 一起带走——
+  // 「执行后先记录再观察」只有在这里兜住异常时才真的成立
+  try {
+    const post = probeId ? await deps.probe(probeId) : null;
+    rec.verify = await deps.checkStep({
+      actionId,
+      exec: outcome.result,
+      rawArgv: outcome.rawArgv,
+      pre,
+      post,
+    });
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    rec.verify = { ok: false, checks: [{ name: "verify_crashed", ok: false, detail }] };
+  }
+  await deps.record?.("verify", step, rec.verify);
+
+  if (!rec.verify.ok) {
+    rt.unresolvedFailure = true;
+    rt.recoveries++;
+    if (rt.recoveries > limits.maxRecoveries) {
+      rec.reasons.push(`连续 ${rt.recoveries} 次验证失败，超过恢复预算 ${limits.maxRecoveries}`);
+      state.status = "blocked";
+      return "stop";
+    }
+    rec.reasons.push(`验证未通过；重新观察并改走其他路径（恢复 ${rt.recoveries}/${limits.maxRecoveries}）`);
+    return "continue";
+  }
+
+  // 只有验证通过的产物才能进入后续步骤。否则一次未确认成功的网页地址或对象 id
+  // 会污染下一步，让“恢复”沿着错误事实继续执行。
+  state.artifacts.push(...outcome.artifacts);
+  rt.unresolvedFailure = false;
+  return "continue";
 }
 
 export { isTaskAction };
+export type { PendingConfirmation };

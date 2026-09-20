@@ -37,13 +37,67 @@ export type ActionParam = {
   optional: boolean;
 };
 
+/**
+ * 无障碍侧读取失败的分类。
+ *
+ * 一律按 AppleScript 错误号判定，不按错误文本。本机实测 osascript 的错误消息
+ * 跟随系统语言：`error number -1743` 在中文环境下是「未获得授权将Apple事件发送给…」，
+ * 英文环境下是另一句话。拿文本当判据，换一个语言环境就全部落空。
+ */
+export type AxFault =
+  /** 缺「辅助功能」授权：看得见进程，看不见它的窗口和窗口里的控件。 */
+  | "accessibility"
+  /** 缺「自动化」授权：连 System Events 都发不进去。 */
+  | "automation"
+  | "timeout"
+  /**
+   * 没认出来。这是 fail-closed 的兜底：宁可说「不知道」，
+   * 也不能因为没认出错误号就退回「它没有窗口」——那正是这次要修的那个静默降级。
+   */
+  | "unknown";
+
+/**
+ * 前台窗口的读取结果。
+ *
+ * 三个态刻意分开，而不是压成一个 `string | null`：
+ * 「这个应用确实没有窗口」和「我们没有权限看它的窗口」在 null 上是同一个值，
+ * 但对用户是两句完全不同的话——一句是事实陈述，一句是「去系统设置里授权」。
+ * 此前两者一起被 `try … end try` 吞掉，调用方无从分辨，于是只能都当成前者。
+ *
+ * 权限失败落在 `unavailable` 而不是 `none`，是这个类型唯一要守的不变式。
+ */
+export type WindowView =
+  /** 真的读到了。title 为空串表示窗口存在但没有标题，这与「没有窗口」不是一回事。 */
+  | { kind: "window"; title: string }
+  /** 问到了，进程确实一个窗口都没有。 */
+  | { kind: "none" }
+  /** 没能问到。`detail` 是给人看的一句话，不写进留痕。 */
+  | { kind: "unavailable"; fault: AxFault; detail: string };
+
+/**
+ * 窗口内元素的读取结果。
+ *
+ * 只有两个态：读到了（可能是空数组——窗口里确实没有可交互控件）和没能读到。
+ * 不需要与 `WindowView` 对称的第三态，因为「元素为空」本身就是一个合法的读数。
+ */
+export type ElementsView =
+  | { kind: "elements"; items: UIElement[] }
+  | { kind: "unavailable"; fault: AxFault; detail: string };
+
 /** 一次感知快照：当下这台机器的结构化状态，作为决策层的 state 输入。 */
 export type Snapshot = {
   at: string;
   /** 前台应用名。 */
   front: string;
-  /** 前台窗口标题，取不到时为 null（例如无窗口的后台代理）。 */
+  /**
+   * 前台窗口标题，取不到时为 null。
+   *
+   * 这是 `windowView` 的扁平投影，保留它只因为决策层与留痕当前直接读它；
+   * **判断「为什么取不到」一律看 `windowView`**，这个字段的 null 是三种原因合一。
+   */
   window: string | null;
+  /** `window` 为什么是现在这个值。权威字段。 */
+  windowView: WindowView;
   /** 正在运行的应用，按最近使用排序。 */
   running: string[];
   /** 当前窗口里可交互的元素，已剔除纯装饰节点。 */
@@ -168,7 +222,67 @@ export type StepRecord = {
   reasons: string[];
 };
 
-export type RunStatus = "running" | "done" | "blocked" | "needs_input";
+/**
+ * 挂起那一刻的世界指纹。
+ *
+ * 用户可能盯着确认气泡看五分钟。这段时间里窗口会关、标签页会换、Chrome profile 会被切走，
+ * 而挂起前拿到的那份快照仍然停在旧世界上。拿它去执行等于「执行前不检查 freshness」。
+ * 所以挂起时记下这几项，恢复时重新观察一次再逐项对账——对不上就不执行。
+ *
+ * 只记这三项而不是整份 Snapshot：`running` 随便启动一个应用就变，`elements` 在
+ * 任何滚动后都不一样，把它们算进来等于「永远判定为陈旧」，那条路和不检查一样没用。
+ */
+export type FreshnessMark = {
+  /** 前台应用名。来自本系统的进程枚举，不是用户内容。 */
+  front: string;
+  /** 前台窗口标题。是用户内容，只在内存里参与比对，永不进留痕。 */
+  window: string | null;
+  /** profile 闸门的身份，形如 `allowed:Default`。由 policy.ts 拼，loop 不解释它。 */
+  profile: string;
+};
+
+/**
+ * 恢复一次挂起所需的全部内部状态。
+ *
+ * 刻意全是平凡数据（没有 Set、没有闭包、没有 OfferSet）：它挂在 `RunState` 上，
+ * 而 `RunState` 会被 `session.ts` 翻译、被 CLI 打印。任何一处不小心序列化它，
+ * 后果应该是「多了几个无用字段」而不是「崩掉」或「泄露一个函数闭包里的东西」。
+ *
+ * 这里没有 `offerSet` 和 `utterance`：前者由恢复的调用方原样传回（必须是同一套动作面，
+ * 换一套就等于把历史重新解释成一条新命令），后者本来就在 `RunState.utterance` 上。
+ */
+export type LoopCheckpoint = {
+  /** 重复守卫已经用掉的键。挂起的那个动作**不在**里面——它还没执行过。 */
+  proposed: string[];
+  waits: number;
+  /** 恢复预算的已用量。等人回答不是一次失败，所以它原样穿过挂起。 */
+  recoveries: number;
+  unresolvedFailure: boolean;
+  /** 待确认动作的参数来源，挂起那一刻就冻住，恢复时不重新问模型。 */
+  span: string | null;
+  bodySource: string | null;
+  freshness: FreshnessMark;
+};
+
+/**
+ * 一个等人拍板的动作。
+ *
+ * 它的存在本身就是「一个决定最多执行一次」的风险面：同一个决定在挂起和恢复两个时刻
+ * 各被看见一次。`confirmId` 是把这两次钉在一起的东西——恢复时对不上号就不执行，
+ * 而消费掉一次之后这个 id 再也不会复现（重新挂起会铸一个新的）。
+ */
+export type PendingConfirmation = {
+  /** 每次挂起现铸一个。Swift 原样回传，对不上就是 fail-closed 的拦截点。 */
+  confirmId: string;
+  /** 挂在第几步。恢复时从这一步继续，不新开一步。 */
+  step: number;
+  actionId: string;
+  /** 为什么要问人，来自 policy。给人看的，不进留痕（里面可能带 profile 目录名）。 */
+  reasons: string[];
+  checkpoint: LoopCheckpoint;
+};
+
+export type RunStatus = "running" | "done" | "blocked" | "needs_input" | "waiting_for_confirmation";
 
 export type RunState = {
   runId: string;
@@ -176,4 +290,9 @@ export type RunState = {
   status: RunStatus;
   steps: StepRecord[];
   artifacts: Artifact[];
+  /**
+   * 只在 `status === "waiting_for_confirmation"` 时存在，而且**恢复时第一件事就是把它清掉**。
+   * 两者是同一条不变式的两半：有挂起点才可能恢复，恢复过一次就不再有挂起点。
+   */
+  pending?: PendingConfirmation;
 };

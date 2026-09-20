@@ -41,6 +41,96 @@ function stateOf(s: Snapshot, utterance: string) {
   };
 }
 
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 模型调用的超时与重试：三处 systemOne 调用（route/pick/judge）共用
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/** 单次模型调用的超时预算，风格对齐 osa.ts 的 OsaOptions.timeoutMs。 */
+const MODEL_TIMEOUT_MS = 25_000;
+
+/** 超过这个次数就认输：429/503/529 都指向"服务端暂时顶不住"，不是永久性故障。 */
+const MAX_MODEL_RETRIES = 3;
+
+/**
+ * 只重试这三个状态码。其余错误（400/401、凭证缺失、断网）立即抛出——
+ * 闷头重试会把配置错误伪装成偶发故障，也会让"应在超时预算内报错"这条
+ * 验收失真成"超时预算 × 重试次数"。
+ */
+const RETRYABLE_STATUS = new Set([429, 503, 529]);
+
+function retryableStatus(err: unknown): boolean {
+  const status = (err as { status?: unknown } | null)?.status;
+  return typeof status === "number" && RETRYABLE_STATUS.has(status);
+}
+
+/**
+ * 关掉 SDK 自带的重试。
+ *
+ * SDK 默认 `maxRetries: 2`，对 408/429/500-599 整段都重试，还会
+ * `respectRetryAfter` 等到最长 60 s（见 `@typesafe-ai/sdk` 的 `DEFAULT_RETRY_POLICY`）。
+ * 不关掉的话会跟 callModel 自己那层重试叠加：次数相乘（最坏情况一次 judge()
+ * 打出十余次请求，对被限流的 429 尤其糟），而且 SDK 内部的退避会算在我们
+ * 对外承诺的 25 s 超时预算里，导致看到的是超时而不是真实错误。
+ *
+ * 重试范围也刻意比 SDK 默认窄：只认 429/503/529（服务端"暂时顶不住"），
+ * 不包括 SDK 默认覆盖的其余 5xx（比如 500）——那类更可能是这次请求本身
+ * 触发了服务端 bug，重试解决不了，只会拖长故障发现时间。重试权全部收归
+ * `callModel`，SDK 层必须是 0。
+ */
+const NO_SDK_RETRY = { maxRetries: 0 } as const;
+
+/** 指数退避等待，可被 signal 提前中止——调用方取消时不该在这里傻等。 */
+function backoff(attempt: number, signal?: AbortSignal): Promise<void> {
+  const ms = Math.min(500 * 2 ** attempt, 5000);
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason as Error);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal?.reason as Error);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/**
+ * 给一次模型调用套上超时与重试。
+ *
+ * 超时用 AbortController：调用方传入的 signal 与内部计时器必须共用同一个
+ * controller，谁先触发就中止请求——只认其中一个的话，调用方主动取消时
+ * 请求会傻等到超时预算耗尽才收场，这正是要避免的 bug。
+ */
+async function callModel<T>(
+  attemptOnce: (signal: AbortSignal) => Promise<T>,
+  outerSignal?: AbortSignal,
+): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    const controller = new AbortController();
+    const onAbort = () => controller.abort(outerSignal?.reason);
+    if (outerSignal?.aborted) onAbort();
+    else outerSignal?.addEventListener("abort", onAbort, { once: true });
+    const timer = setTimeout(
+      () => controller.abort(new Error(`模型调用超过 ${MODEL_TIMEOUT_MS}ms`)),
+      MODEL_TIMEOUT_MS,
+    );
+    try {
+      return await attemptOnce(controller.signal);
+    } catch (err) {
+      // 调用方主动取消：这是"不要了"，不是"再试一次"
+      if (outerSignal?.aborted || attempt >= MAX_MODEL_RETRIES || !retryableStatus(err)) {
+        throw err;
+      }
+      await backoff(attempt, outerSignal);
+    } finally {
+      clearTimeout(timer);
+      outerSignal?.removeEventListener("abort", onAbort);
+    }
+  }
+}
+
 export class JevBackend implements DecisionBackend {
   readonly name = "jev";
   private client: TypeSafeClient;
@@ -57,14 +147,19 @@ export class JevBackend implements DecisionBackend {
     opts["none"] = "这句话没有指向任何具体应用，或还听不出意图";
 
     // 三个问题一次问完：它们互相独立，分开问只会多付两次往返
-    const r = await this.client.systemOne({
-      state: stateOf(snapshot, utterance),
-      questions: {
-        app: choice("用户这句话想操作哪个应用？", opts),
-        complete: noul("这句话已经把要做的事说完整了吗？还在半句中途则为否。"),
-        destructive: noul("这句话要求删除、清空或销毁数据吗？"),
-      },
-    });
+    const r = await callModel((signal) =>
+      this.client.systemOne(
+        {
+          state: stateOf(snapshot, utterance),
+          questions: {
+            app: choice("用户这句话想操作哪个应用？", opts),
+            complete: noul("这句话已经把要做的事说完整了吗？还在半句中途则为否。"),
+            destructive: noul("这句话要求删除、清空或销毁数据吗？"),
+          },
+        },
+        { signal, timeout: MODEL_TIMEOUT_MS, retry: NO_SDK_RETRY },
+      ),
+    );
 
     const a = r.answers.app;
     return {
@@ -87,13 +182,18 @@ export class JevBackend implements DecisionBackend {
     }
     opts["none"] = "这些命令里没有一个符合用户的意图";
 
-    const r = await this.client.systemOne({
-      state: stateOf(snapshot, utterance),
-      questions: {
-        action: choice("应该执行哪一个命令来完成用户的要求？", opts),
-        destructive: noul("执行这个命令会不可逆地删除或覆盖用户的数据吗？"),
-      },
-    });
+    const r = await callModel((signal) =>
+      this.client.systemOne(
+        {
+          state: stateOf(snapshot, utterance),
+          questions: {
+            action: choice("应该执行哪一个命令来完成用户的要求？", opts),
+            destructive: noul("执行这个命令会不可逆地删除或覆盖用户的数据吗？"),
+          },
+        },
+        { signal, timeout: MODEL_TIMEOUT_MS, retry: NO_SDK_RETRY },
+      ),
+    );
 
     const a = r.answers.action;
     return {
@@ -169,7 +269,17 @@ function asNoul(value: unknown, fallback: number): number {
   return typeof a?.noul === "number" ? a.noul : fallback;
 }
 
-function checkDistribution(name: string, p: Record<string, number>, violations: string[]): void {
+/**
+ * @param expectedKeys 送去给模型选的选项集合——分布的键必须正好与它相等。
+ * @param selected 模型实际选中的那个 choice，必须是分布里概率最大的键。
+ */
+function checkDistribution(
+  name: string,
+  p: Record<string, number>,
+  violations: string[],
+  expectedKeys: readonly string[],
+  selected: string,
+): void {
   const keys = Object.keys(p);
   if (keys.length === 0) return; // 没给分布不算违规，只是少了留痕
   const sum = keys.reduce((s, k) => s + p[k], 0);
@@ -178,6 +288,24 @@ function checkDistribution(name: string, p: Record<string, number>, violations: 
   }
   for (const k of keys) {
     if (p[k] < 0 || p[k] > 1) violations.push(`${name} 的 ${k} 概率 ${p[k]} 越界`);
+  }
+  // 键必须与选项集合正好一致：多出的键是模型在编造选项之外的东西，
+  // 少了的键说明分布不完整——包含关系不够，必须是同一个集合
+  const got = new Set(keys);
+  const expected = new Set(expectedKeys);
+  const extra = keys.filter((k) => !expected.has(k));
+  const missing = expectedKeys.filter((k) => !got.has(k));
+  if (extra.length > 0 || missing.length > 0) {
+    const parts = [];
+    if (extra.length > 0) parts.push(`多出 ${JSON.stringify(extra)}`);
+    if (missing.length > 0) parts.push(`缺少 ${JSON.stringify(missing)}`);
+    violations.push(`${name} 的概率分布键与选项集合不符：${parts.join("，")}`);
+  }
+  // 被选中项必须是概率最大的那个：choice 与 probabilities 互相矛盾，
+  // 说明这两个字段至少有一个是编的，整条答案不可信
+  const maxProb = Math.max(...keys.map((k) => p[k]));
+  if (!(selected in p) || p[selected] < maxProb) {
+    violations.push(`${name} 选中的 ${JSON.stringify(selected)} 不是概率最大的选项`);
   }
 }
 
@@ -199,7 +327,11 @@ function richState(input: JudgeInput) {
   };
 }
 
-export async function judge(client: TypeSafeClient, input: JudgeInput): Promise<Decision> {
+export async function judge(
+  client: TypeSafeClient,
+  input: JudgeInput,
+  signal?: AbortSignal,
+): Promise<Decision> {
   const t0 = Date.now();
   const violations: string[] = [];
 
@@ -234,10 +366,14 @@ export async function judge(client: TypeSafeClient, input: JudgeInput): Promise<
     questions.body = choice("要写进备忘录的内容应该取自哪里？", bodyOpts);
   }
 
-  const r = await client.systemOne({
-    state: richState(input),
-    questions: questions as never,
-  });
+  const r = await callModel(
+    (s) =>
+      client.systemOne(
+        { state: richState(input), questions: questions as never },
+        { signal: s, timeout: MODEL_TIMEOUT_MS, retry: NO_SDK_RETRY },
+      ),
+    signal,
+  );
   const latency_ms = Date.now() - t0;
   const answers = r.answers as Record<string, unknown>;
 
@@ -252,7 +388,7 @@ export async function judge(client: TypeSafeClient, input: JudgeInput): Promise<
       violations: ["模型没有返回 action 答案"],
     };
   }
-  checkDistribution("action", action.probabilities, violations);
+  checkDistribution("action", action.probabilities, violations, Object.keys(actionOpts), action.choice);
 
   // 逐字校验：模型必须挑我们给过的片段，而那些片段必须是原话里原封不动的一段。
   // 没有这道校验，"模型只 pick 不生成"就只是约定而非保证。
@@ -267,7 +403,7 @@ export async function judge(client: TypeSafeClient, input: JudgeInput): Promise<
       violations.push(`片段 ${JSON.stringify(picked.choice)} 不是用户原话的逐字子串`);
     } else {
       span = picked.choice;
-      checkDistribution("span", picked.probabilities, violations);
+      checkDistribution("span", picked.probabilities, violations, input.spans, picked.choice);
     }
   } else if (input.spans.length === 1) {
     span = input.spans[0];

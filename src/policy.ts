@@ -1,6 +1,6 @@
 import { CHROME_APP, isAllowedApp } from "./config.ts";
 import type { ScriptTemplate } from "./scripts.ts";
-import { isTaskAction, type ActionSpec, type Judgement, type ProfileGate } from "./types.ts";
+import { isTaskAction, type ActionSpec, type FreshnessMark, type Judgement, type ProfileGate, type Snapshot } from "./types.ts";
 
 /**
  * 策略层：把一个带概率的判断变成"要不要真发出去"。
@@ -148,4 +148,78 @@ export function policy(input: PolicyInput): PolicyResult {
     actionId: id,
     reasons: [`置信度 ${j.confidence.toFixed(2)}、完整度 ${j.complete.toFixed(2)}，静态风险 ${spec.risk}`],
   };
+}
+
+// ── 挂起与恢复之间的那段时间 ────────────────────────────────────────────────
+
+/**
+ * 把「此刻的世界」压成一份可比对的指纹。
+ *
+ * 放在 policy.ts 而不是 loop.ts，理由和上面四道闸一样：这是安全判据，
+ * 而安全判据要能被穷举测试，前提是它不依赖外部世界。这里只做投影，不做 IO——
+ * 快照由调用方观察好了传进来。
+ */
+export function freshnessMark(snapshot: Snapshot, gate: ProfileGate | undefined): FreshnessMark {
+  return { front: snapshot.front, window: snapshot.window, profile: gateIdentity(gate) };
+}
+
+/**
+ * profile 闸门的身份串。
+ *
+ * 比的是「凭什么放行」的整体，不只是目录名：`unknown:Default` 与 `allowed:Default`
+ * 是两回事，前者要问人、后者不用。省略等于 `undetectable`，与 `profileBlock` 同一个缺省。
+ */
+function gateIdentity(gate: ProfileGate | undefined): string {
+  const g = gate ?? { kind: "undetectable" as const, detail: "" };
+  if (g.kind === "allowed") return `allowed:${g.dir}`;
+  if (g.kind === "unknown") return `unknown:${g.dir}`;
+  if (g.kind === "dry-run") return "dry-run";
+  return "undetectable";
+}
+
+export type Staleness = {
+  /** 判据名。是代码常量，可以进留痕。 */
+  field: "front" | "window" | "profile";
+  /** 给人看的一句话。**不要写进留痕**——它会带上窗口标题或 profile 目录名。 */
+  detail: string;
+};
+
+export type FreshnessInput = {
+  /** 挂起那一刻记下的。 */
+  mark: FreshnessMark;
+  /** 恢复这一刻重新观察出来的。 */
+  now: FreshnessMark;
+  /**
+   * 待执行动作归属的应用。
+   *
+   * **省略等于「不知道是谁」，于是每条判据都适用**，包括只对 Chrome 有意义的 profile。
+   * 缺省放宽的话，一个查不到 spec 的动作就正好绕开了这道闸。
+   */
+  app?: string;
+};
+
+/**
+ * 挂起期间世界变了没有。空数组 = 没变，可以按挂起时的决定继续。
+ *
+ * 为什么 front 与 window 也算数，哪怕今天这两个动作（开标签页、记笔记）都不读它们：
+ * 用户说「好」时同意的是**他当时看到的那件事**。窗口换了就说明他看到的那个世界
+ * 已经不在了，此时执行的是一个没人真正批准过的动作。这条判据宁可误伤——
+ * 误伤的代价是用户再说一遍，放过的代价是在错误的世界里发出真实的 Apple Event。
+ *
+ * profile 只对 Chrome 生效，与 `profileBlock` 保持同一个作用域：给 Notes 套这条毫无意义，
+ * 只会让「切了个 Chrome 窗口」把一条笔记也拦下来。
+ */
+export function staleness(input: FreshnessInput): Staleness[] {
+  const { mark, now } = input;
+  const out: Staleness[] = [];
+  if (mark.front !== now.front) {
+    out.push({ field: "front", detail: `前台应用从 ${mark.front} 变成了 ${now.front}` });
+  }
+  if (mark.window !== now.window) {
+    out.push({ field: "window", detail: `前台窗口标题从 ${mark.window ?? "（无）"} 变成了 ${now.window ?? "（无）"}` });
+  }
+  if ((input.app ?? CHROME_APP) === CHROME_APP && mark.profile !== now.profile) {
+    out.push({ field: "profile", detail: `Chrome profile 闸门从 ${mark.profile} 变成了 ${now.profile}` });
+  }
+  return out;
 }

@@ -31,6 +31,10 @@ coverage/
 *.tsbuildinfo
 *.scpt
 
+# SwiftPM 构建产物：每次构建都变，体积以百 MB 计（当前 apps/macos/.build 197M），
+# 可从 Package.swift 完全重新生成，没有理由进仓库。
+.build/
+
 # 编辑器与系统
 .DS_Store
 .idea/

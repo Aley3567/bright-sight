@@ -5,6 +5,7 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 import { PROBES, REGISTRY, type ScriptTemplate } from "../src/scripts.ts";
+import { PERCEIVE_SCRIPTS } from "../src/perceive.ts";
 
 const run = promisify(execFile);
 
@@ -38,6 +39,17 @@ for (const t of ALL) {
   test(`compile: ${t.id} 的脚本能通过 AppleScript 编译器`, async () => {
     const r = await compiles(t.src);
     assert.ok(r.ok, `${t.id} 编译失败：${r.err}`);
+  });
+}
+
+/**
+ * 感知层的脚本不在 scripts.ts 的注册表里（它们是只读感知，不是可被模型选中的动作），
+ * 但保留字这个坑跟在不在注册表里毫无关系。不把它们挂进来就等于给自己开了个后门。
+ */
+for (const [id, src] of Object.entries(PERCEIVE_SCRIPTS)) {
+  test(`compile: ${id} 的脚本能通过 AppleScript 编译器`, async () => {
+    const r = await compiles(src);
+    assert.ok(r.ok, `${id} 编译失败：${r.err}`);
   });
 }
 

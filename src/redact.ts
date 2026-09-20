@@ -135,6 +135,21 @@ function redactEvent(phase: string, data: unknown, salt: string): unknown {
       // 状态、步数、耗时，全是结构
       return d;
 
+    case "suspend":
+    case "resume": {
+      // 挂起/恢复这一对全是结构：confirmId 是本轮现铸的随机串（不是用户内容，
+      // 而且抹掉它就再也对不上「哪一次挂起后来被谁恢复了」），actionId 是动作 id，
+      // gate 与 stale 是枚举值与判据名，approved 是布尔。
+      //
+      // 刻意**不**在这里放行 reasons / detail：待确认的理由里会带 Chrome profile 目录名
+      // 与窗口标题。白名单之外一律指纹化，是为了让「以后往这条事件里加字段」的默认后果
+      // 是过度脱敏，而不是静默泄露。
+      const keep = new Set(["confirmId", "actionId", "gate", "approved", "stale", "step"]);
+      const out: Rec = {};
+      for (const [k, v] of Object.entries(d)) out[k] = keep.has(k) ? v : deep(v, salt);
+      return out;
+    }
+
     default:
       return deep(data, salt);
   }

@@ -114,6 +114,38 @@ test("redact: run.start 抹掉用户原话，保留步数上限与选项数", ()
   assert.ok(fp(out.utterance).len > 0);
 });
 
+test("redact: suspend 保留结构，但不放行任何待确认的理由文本", () => {
+  const r = makeRedactor("hash", SALT);
+  const out = r.event("suspend", {
+    confirmId: "01J0000000000000000000",
+    actionId: "Google Chrome.make-tab",
+    gate: "unknown",
+    // 白名单之外的字段：哪怕将来有人顺手把 reasons 塞进来，也只能落成指纹
+    reasons: ["Chrome profile Profile 7 不在允许名单内，需要当场确认"],
+  }) as Record<string, unknown>;
+  assert.equal(out.confirmId, "01J0000000000000000000", "对不上「哪一次挂起」的留痕等于没有");
+  assert.equal(out.actionId, "Google Chrome.make-tab");
+  assert.equal(out.gate, "unknown");
+  for (const leaked of leakedStrings(out.reasons)) {
+    assert.equal(leaked.includes("Profile 7"), false, "profile 目录名不进留痕");
+  }
+});
+
+test("redact: resume 保留 approved 与陈旧判据名，但判据的 detail 进不去", () => {
+  const r = makeRedactor("hash", SALT);
+  const out = r.event("resume", {
+    confirmId: "01J0000000000000000000",
+    approved: true,
+    stale: ["front", "window"],
+    detail: "前台窗口标题从 我的私密文档 变成了 别的",
+  }) as Record<string, unknown>;
+  assert.equal(out.approved, true);
+  assert.deepEqual(out.stale, ["front", "window"], "「哪条判据判它陈旧」必须读得出来");
+  assert.ok(fp(out.detail).len > 0);
+  // 阳性对照：同一个串确实在原始 data 里，所以「读不到」不是因为压根没写过它
+  assert.equal(leakedStrings(out).some((x) => x.includes("我的私密文档")), false);
+});
+
 test("redact: 没见过的 phase 一律全量指纹化——忘了加规则的后果是过度脱敏", () => {
   const r = makeRedactor("hash", SALT);
   const out = r.event("某个将来才有的阶段", { anything: "一段敏感内容", n: 3 }) as Record<string, unknown>;

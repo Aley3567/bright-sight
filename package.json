@@ -15,7 +15,10 @@
     "test": "node --test 'test/**/*.test.ts'",
     "typecheck": "tsc --noEmit",
     "check": "npm run typecheck && npm test",
-    "test:live": "BRIGHTSIGHT_LIVE=1 node --test 'test/**/*.test.ts'"
+    "test:live": "BRIGHTSIGHT_LIVE=1 node --test 'test/**/*.test.ts'",
+    "voice:test": "swift test --package-path apps/macos",
+    "voice:build": "bash apps/macos/scripts/build-app.sh",
+    "voice:open": "bash apps/macos/scripts/build-app.sh --open"
   },
   "dependencies": {
     "@typesafe-ai/sdk": "^0.6.0"

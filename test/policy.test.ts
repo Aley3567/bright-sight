@@ -1,8 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { THRESHOLDS, policy } from "../src/policy.ts";
+import { THRESHOLDS, freshnessMark, policy, staleness } from "../src/policy.ts";
 import { REGISTRY } from "../src/scripts.ts";
-import type { ActionSpec, Judgement } from "../src/types.ts";
+import type { ActionSpec, Judgement, ProfileGate, Snapshot } from "../src/types.ts";
 
 const NOTE = "Notes.make-note";
 const OFFERED = [NOTE, "Google Chrome.make-tab", "ASK", "WAIT", "DONE", "BLOCKED", "UNSUPPORTED"];
@@ -207,4 +207,84 @@ test("policy: dry-run 不是万能通行证——前三道硬闸照样拦", () =
   });
   assert.equal(r.kind, "confirm");
   assert.match(r.reasons.join(""), /破坏性/);
+});
+
+// ── freshness：挂起与恢复之间那段时间 ──
+// 这几条判据和上面四道闸装在同一条路径上（policy 拦成 confirm → 挂起 → 恢复前再查这里），
+// 所以除了「变了就拦得住」，还要压住「不该管的别管」和「一点没变时真的放行」。
+
+const AT = "2026-09-20T00:00:00.000Z";
+
+function snap(over: Partial<Snapshot> = {}): Snapshot {
+  return {
+    at: AT,
+    front: "Google Chrome",
+    window: "example.com — 某个标签页",
+    windowView: { kind: "window", title: "example.com — 某个标签页" },
+    running: ["Google Chrome"],
+    elements: [],
+    selection: null,
+    ...over,
+  };
+}
+
+const UNKNOWN_7: ProfileGate = { kind: "unknown", dir: "Profile 7" };
+
+test("freshness: 一点没变就放行——阳性对照，否则下面几条「拦住了」什么都不说明", () => {
+  const mark = freshnessMark(snap(), UNKNOWN_7);
+  assert.deepEqual(staleness({ mark, now: freshnessMark(snap(), UNKNOWN_7), app: "Google Chrome" }), []);
+  // 而且这份指纹确实取到了东西，不是三个 undefined 互相相等
+  assert.equal(mark.front, "Google Chrome");
+  assert.equal(mark.profile, "unknown:Profile 7");
+});
+
+test("freshness: 前台应用、窗口标题、profile 各自都拦得住", () => {
+  const mark = freshnessMark(snap(), UNKNOWN_7);
+  const cases: [string, Snapshot, ProfileGate, string][] = [
+    ["front", snap({ front: "Notes" }), UNKNOWN_7, "front"],
+    ["window", snap({ window: "换了个标签页" }), UNKNOWN_7, "window"],
+    ["window 关掉了", snap({ window: null }), UNKNOWN_7, "window"],
+    ["profile", snap(), { kind: "unknown", dir: "Profile 9" }, "profile"],
+    ["探测不到了", snap(), { kind: "undetectable", detail: "读不到 Local State" }, "profile"],
+  ];
+  for (const [name, now, gate, field] of cases) {
+    const hit = staleness({ mark, now: freshnessMark(now, gate), app: "Google Chrome" });
+    assert.deepEqual(hit.map((h) => h.field), [field], name);
+  }
+});
+
+test("freshness: unknown 与 allowed 是两回事——目录名相同也算变了", () => {
+  // 挂起时人批准的是「在一个不在名单里的 profile 上做这件事」。名单中途被改了，
+  // 那就不再是他批准的那件事了。宁可再问一次
+  const mark = freshnessMark(snap(), UNKNOWN_7);
+  const now = freshnessMark(snap(), { kind: "allowed", dir: "Profile 7", via: "settings" });
+  assert.deepEqual(staleness({ mark, now, app: "Google Chrome" }).map((h) => h.field), ["profile"]);
+});
+
+test("freshness: profile 判据只管 Chrome，不越界到 Notes", () => {
+  const mark = freshnessMark(snap(), UNKNOWN_7);
+  const now = freshnessMark(snap(), { kind: "unknown", dir: "Profile 9" });
+  assert.deepEqual(staleness({ mark, now, app: "Notes" }), [], "profile 是 Chrome 独有的概念");
+  // 不越界不等于放水：同一次漂移在 Chrome 上照样拦
+  assert.equal(staleness({ mark, now, app: "Google Chrome" }).length, 1);
+});
+
+test("freshness: 不知道是哪个应用时，profile 判据照样适用——缺省即保守", () => {
+  const mark = freshnessMark(snap(), UNKNOWN_7);
+  const now = freshnessMark(snap(), { kind: "unknown", dir: "Profile 9" });
+  assert.deepEqual(staleness({ mark, now }).map((h) => h.field), ["profile"]);
+});
+
+test("freshness: 变了好几项就逐项说清楚，不是一句「变了」", () => {
+  const mark = freshnessMark(snap(), UNKNOWN_7);
+  const now = freshnessMark(snap({ front: "Notes", window: null }), { kind: "undetectable", detail: "x" });
+  const hit = staleness({ mark, now });
+  assert.deepEqual(hit.map((h) => h.field), ["front", "window", "profile"]);
+  for (const h of hit) assert.ok(h.detail.length > 0, h.field);
+});
+
+test("freshness: undetectable 的 detail 变了不算世界变了——它是给人看的一句话", () => {
+  const mark = freshnessMark(snap(), { kind: "undetectable", detail: "读不到 Local State" });
+  const now = freshnessMark(snap(), { kind: "undetectable", detail: "Preferences 也读不到" });
+  assert.deepEqual(staleness({ mark, now }), []);
 });

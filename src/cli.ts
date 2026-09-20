@@ -1,6 +1,9 @@
-// bright-sight <command>：run | surface | probe | journal
+// bright-sight <command>：run | serve | surface | probe | journal
 import { readdir } from "node:fs/promises";
 import { LIMITS, resolveEngine } from "./config.ts";
+// 只用于给下面两处递归闭包写返回类型；`import type` 会被整条擦掉，不会破坏懒加载
+import type { SessionRunOutput } from "./session.ts";
+import type { RunState } from "./types.ts";
 
 const USAGE = `bright-sight — 不看屏幕的 macOS 桌面智能体
 
@@ -9,6 +12,11 @@ const USAGE = `bright-sight — 不看屏幕的 macOS 桌面智能体
         默认 dry-run：只打印每一步解析出的完整 argv，不投递任何 Apple Event。
         --execute 才真发。注意 dry-run 只能演练到第一步——第二步的参数依赖
         第一步的真实回读（浏览器最终停在哪个地址），不执行就拿不到。
+
+  bright-sight serve
+        长驻 JSON Lines RPC 服务端，供 macOS 语音条（apps/macos）使用。
+        stdin 收请求、stdout 发响应，双向：核心也会反过来向 App 发起调用。
+        协议定义在 src/protocol.ts，那是两侧唯一的依据。人不该手动跑它。
 
   bright-sight surface [--all] [--rebuild]
         看动作面：从 sdef 自动长出来的全部命令，以及白名单过滤后真正递给模型的选项。
@@ -145,10 +153,125 @@ async function cmdRun(args: Args): Promise<number> {
   const failures = journal.failures();
   if (failures > 0) console.log(`\n留痕有 ${failures} 条没写进去（不影响已经发生的操作，但这次记录不完整）`);
   console.log(`\n结果: ${state.status}`);
+  if (state.status === "waiting_for_confirmation") {
+    // CLI 没有确认气泡，也不该临时造一个：确认入口是 `session.confirm`，
+    // 只有长驻的 serve 通道能提供「同一条 run 上继续」的语义
+    console.log(`这一步要人拍板，而 run 子命令没有确认入口——它停在这里，什么都没有发出去。`);
+  }
   if (dryRun && state.status !== "done") {
     console.log(`dry-run 到此为止是正常的：后续步骤要用前一步真实回读到的值，加 --execute 才能往下走。`);
   }
   return state.status === "done" || dryRun ? 0 : 1;
+}
+
+/** 见 cmdServe 末尾：与 Swift 侧 `CommandExecutor.executionTimeout` 对齐。 */
+const SERVE_DRAIN_TIMEOUT_MS = 90_000;
+
+/**
+ * 长驻 RPC 服务端。
+ *
+ * 和 `cmdRun` 并存而不是取而代之：`cmdRun` 是唯一能在终端里逐步看清
+ * 「解析出什么 argv、哪条判据没过」的入口，调试闭环本身离不开它。
+ * 两条路径共用同一个 `runLoop`，所以不会各自漂移。
+ */
+async function cmdServe(_args: Args): Promise<number> {
+  const { loadOffers } = await import("./surface.ts");
+  const { runLoop, resumeLoop } = await import("./loop.ts");
+  const { judge } = await import("./decide.ts");
+  const { execute } = await import("./execute.ts");
+  const { runProbe, verify } = await import("./verify.ts");
+  const { openJournal, ulid } = await import("./journal.ts");
+  const { snapshotLight } = await import("./perceive.ts");
+  const { precheckProfile } = await import("./confirm.ts");
+  const { makeRedactor, resolveRedactMode } = await import("./redact.ts");
+  const { createPeer } = await import("./rpc.ts");
+  const { makeSessionMethods } = await import("./session.ts");
+  const { NOTIFY_SERVER_READY, PROTOCOL_VERSION } = await import("./protocol.ts");
+  const { TypeSafeClient } = await import("@typesafe-ai/sdk");
+
+  // stdout 从这一刻起是协议信道，不是日志信道：任何一句 console.log 落进去
+  // 都会把 JSON Lines 冲断，而那种故障表现为「Swift 侧偶尔解析失败」，极难查。
+  // 私留一个真句柄给协议用，其余全部改道 stderr（Swift 会把 stderr 当日志收）。
+  const emit = process.stdout.write.bind(process.stdout);
+  process.stdout.write = process.stderr.write.bind(process.stderr) as typeof process.stdout.write;
+
+  const peer = createPeer({
+    write: (chunk) => void emit(chunk),
+    // Node 一律用偶数 id，Swift 一律奇数。两侧各自分配 id，不切开空间就分不清回应归属
+    idParity: "even",
+    onTransportError: (error) => console.error(`[rpc] ${error.layer}/${error.code}: ${error.message}`),
+    methods: makeSessionMethods({
+      offers: () => loadOffers(),
+      // 只看变量在不在，不读值
+      credentialsPresent: () => (process.env.TYPESAFE_API_KEY ?? "") !== "",
+      run: async ({ utterance, execute: doExecute, engine: engineName, offers, signal }) => {
+        const { resolveEngine } = await import("./config.ts");
+        const engine = resolveEngine(engineName);
+        // serve 没有 TTY，没有人可以当场问。闸门状态原样交给 policy，让它拦成 confirm
+        // 并说清原因——阶段 3 的确认气泡接的就是这条 needs_confirmation
+        const pre = await precheckProfile({ ask: null });
+        const mode = resolveRedactMode();
+        const redactor = makeRedactor(mode, pre.settings.journalSalt);
+        const journal = await openJournal({ redact: mode === "hash" ? redactor.event : undefined });
+        const client = new TypeSafeClient();
+
+        const loopDeps = {
+          observe: snapshotLight,
+          decide: (input: Parameters<typeof judge>[1]) => judge(client, input, signal),
+          act: (id: string, ctx: Parameters<typeof execute>[1], step: number) =>
+            execute(id, { ...ctx, engine }, step, { dryRun: !doExecute }),
+          probe: (id: string, argv?: string[]) => (doExecute ? runProbe(id, argv) : Promise.resolve(null)),
+          checkStep: (input: Parameters<typeof verify>[0]) =>
+            doExecute
+              ? verify({ ...input, engine })
+              : Promise.resolve({ ok: true, checks: [{ name: "dry_run", ok: true, detail: "未执行，跳过验证" }] }),
+          record: (phase: Parameters<typeof journal.append>[0], step: number, data: unknown) =>
+            journal.append(phase, step, data),
+        };
+
+        // 恢复前重新探测闸门，绝不沿用挂起那一刻的结论：人盯着确认气泡的这段时间里
+        // profile 完全可能被切走，拿旧结论去执行正是「执行前检查 freshness」要防的事
+        const gateNow = async () =>
+          doExecute ? (await precheckProfile({ ask: null })).gate : ({ kind: "dry-run" } as const);
+
+        // 挂起的 run 要能从**同一个** journal、同一套动作面、同一个 runId 上继续。
+        // 这些东西只在这个闭包里齐全，所以恢复入口在这里造好交出去，
+        // session 层只负责让它最多被调一次
+        const wrap = (state: RunState): SessionRunOutput => ({
+          state,
+          journal: { path: journal.path, redacted: mode === "hash", failures: journal.failures() },
+          ...(state.status === "waiting_for_confirmation"
+            ? {
+                resume: async (approved: boolean) =>
+                  wrap(await resumeLoop(state, offers, approved, loopDeps, { runId: journal.runId, profile: await gateNow() })),
+              }
+            : {}),
+        });
+
+        return wrap(
+          await runLoop(utterance, offers, loopDeps, {
+            runId: journal.runId,
+            profile: doExecute ? pre.gate : ({ kind: "dry-run" } as const),
+          }),
+        );
+      },
+    }),
+  });
+
+  peer.notify(NOTIFY_SERVER_READY, { protocol: PROTOCOL_VERSION, serverId: ulid(), pid: process.pid });
+
+  process.stdin.setEncoding("utf8");
+  process.stdin.on("data", (chunk: string) => peer.ingest(chunk));
+  await new Promise<void>((resolve) => process.stdin.once("end", resolve));
+
+  // 管道关了不等于可以立刻退。手上可能正有一条指令跑到 act 与 verify 之间——
+  // 那一刻退出，Apple Event 已经发出去了，验证和留痕却永远不会落地，
+  // 「执行后由代码验证」当场破掉。所以先把在飞的处理排空。
+  // 上限取 Swift 侧单条指令的整体超时（CommandExecutor.executionTimeout，90 s）：
+  // 超过那个数，对面早就不在等这条结果了，再等下去只是留一个不肯退的孤儿进程。
+  await Promise.race([peer.drain(), new Promise<void>((r) => setTimeout(r, SERVE_DRAIN_TIMEOUT_MS).unref())]);
+  peer.close("stdin 已关闭");
+  return 0;
 }
 
 async function cmdSurface(args: Args): Promise<number> {
@@ -275,6 +398,8 @@ export async function main(argv: string[]): Promise<number> {
   switch (args.cmd) {
     case "run":
       return cmdRun(args);
+    case "serve":
+      return cmdServe(args);
     case "surface":
       return cmdSurface(args);
     case "probe": {

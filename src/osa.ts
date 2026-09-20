@@ -92,10 +92,19 @@ export async function osa(
   }
 }
 
+/**
+ * 超时的错误文本。
+ *
+ * 导出成常量而不是散落两处字面量：调用方要按「是不是超时」分类失败原因
+ * （见 perceive.ts 的 axFailureOfText），靠抄一遍这句中文去比对，
+ * 改了这里就会静默失配。
+ */
+export const OSA_TIMEOUT = "osascript 超时";
+
 /** 把 execFile 抛出的异常压成一行人能读的话。 */
 function describeOsaError(err: unknown): string {
   const e = err as { killed?: boolean; stderr?: string; message?: string };
-  if (e.killed) return "osascript 超时";
+  if (e.killed) return OSA_TIMEOUT;
   const stderr = (e.stderr ?? "").trim();
   if (stderr) return stderr.split("\n")[0] || stderr;
   return e.message ?? String(err);
