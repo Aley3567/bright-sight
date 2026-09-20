@@ -1,6 +1,7 @@
-// bright-sight <command>：run | surface | probe | journal
+// bright-sight <command>：run | surface | probe | journal | feedback | memory
 import { readdir } from "node:fs/promises";
 import { LIMITS, resolveEngine } from "./config.ts";
+import type { MemoryVersion } from "./evolution.ts";
 
 const USAGE = `bright-sight — 不看屏幕的 macOS 桌面智能体
 
@@ -22,6 +23,15 @@ const USAGE = `bright-sight — 不看屏幕的 macOS 桌面智能体
   bright-sight profile [allow <目录名> | forget <目录名>]
         看当前在用的 Chrome profile 与允许名单；allow / forget 增删名单。
         AppleScript 里没有 profile 这个概念，能做的只有「看清楚会落在哪，陌生就问人」。
+
+  bright-sight feedback <runId> "<哪里不对>" [--skill]
+        明确提交一次纠正。默认生成偏好候选；--skill 从 run 中提取 2–5 步语义动作。
+        原始纠正会私密保存，但不会进入日常决策上下文。
+
+  bright-sight memory [list]
+  bright-sight memory validate <id> <runId>
+  bright-sight memory activate|suspend|reject|helpful|forget <id>
+        查看与控制候选。候选通过代码判据验证后才能启用；也支持「忘掉 <id>」等指引。
 
   环境变量:
     TYPESAFE_API_KEY     必需
@@ -145,6 +155,7 @@ async function cmdRun(args: Args): Promise<number> {
   const failures = journal.failures();
   if (failures > 0) console.log(`\n留痕有 ${failures} 条没写进去（不影响已经发生的操作，但这次记录不完整）`);
   console.log(`\n结果: ${state.status}`);
+  console.log(`反馈: bright-sight feedback ${journal.runId} "说明哪里不对"`);
   if (dryRun && state.status !== "done") {
     console.log(`dry-run 到此为止是正常的：后续步骤要用前一步真实回读到的值，加 --execute 才能往下走。`);
   }
@@ -270,6 +281,134 @@ async function cmdProfile(args: Args): Promise<number> {
   return 0;
 }
 
+async function cmdFeedback(args: Args): Promise<number> {
+  const { journalDir, readJournal } = await import("./journal.ts");
+  const { evidenceFromJournal, openEvolutionStore } = await import("./evolution.ts");
+  const [runArg, ...words] = args.pos;
+  const correction = words.join(" ").trim();
+  if (!runArg || !correction) {
+    console.error(`用法: bright-sight feedback <runId> "<哪里不对>" [--skill]`);
+    return 2;
+  }
+  const file = runArg.includes("/") || runArg.includes("\\")
+    ? runArg
+    : `${journalDir()}/${runArg.endsWith(".jsonl") ? runArg : `${runArg}.jsonl`}`;
+  const { events, broken } = await readJournal(file);
+  if (events.length === 0) {
+    console.error(`找不到可读取的 run: ${runArg}`);
+    return 2;
+  }
+  if (broken > 0) {
+    console.error(`这条 run 有 ${broken} 行损坏，先修复留痕再生成候选。`);
+    return 1;
+  }
+
+  try {
+    const evidence = evidenceFromJournal(events);
+    const proposed = args.flags.skill === true
+      ? { kind: "skill" as const, steps: evidence.steps }
+      : { kind: "preference" as const, instruction: correction };
+    const { memory } = await openEvolutionStore().recordCorrection({
+      runId: events[0].runId,
+      scope: evidence.scope,
+      rawConversation: [correction],
+      verifyFailures: evidence.verifyFailures,
+      proposed,
+    });
+    console.log(`已保存候选 ${memory.id}（v${memory.version}）`);
+    console.log(`作用域: ${memory.scope.application} / ${memory.scope.taskKind}`);
+    console.log(`状态: candidate / validation=pending，不会自动执行或绕过 Policy`);
+    return 0;
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : String(err));
+    return 2;
+  }
+}
+
+function memorySummary(memory: MemoryVersion): string {
+  const body = memory.body.kind === "preference"
+    ? memory.body.instruction
+    : memory.body.steps.map((step) => step.actionId).join(" → ");
+  return `[${memory.status}/${memory.validation.status}] ${memory.id} v${memory.version}\n  ${memory.scope.application} / ${memory.scope.taskKind}\n  ${body}`;
+}
+
+async function cmdMemory(args: Args): Promise<number> {
+  const { evidenceFromJournal, openEvolutionStore, scopeKey } = await import("./evolution.ts");
+  const store = openEvolutionStore();
+  const natural: Record<string, string> = { "忘掉": "forget", "忘记": "forget", "暂停": "suspend", "恢复": "activate" };
+  const [rawSub = "list", id, extra] = args.pos;
+  const sub = natural[rawSub] ?? rawSub;
+
+  try {
+    if (sub === "list") {
+      await store.prune();
+      const memories = await store.list();
+      if (memories.length === 0) {
+        console.log("还没有候选或活动记忆。");
+        return 0;
+      }
+      for (const memory of memories.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))) {
+        console.log(`${memorySummary(memory)}\n`);
+      }
+      return 0;
+    }
+    if (sub === "prune") {
+      console.log(`已清理 ${await store.prune()} 个过期候选或历史版本。`);
+      return 0;
+    }
+    if (!id) {
+      console.error(`缺少记忆 id。`);
+      return 2;
+    }
+    if (sub === "validate") {
+      if (!extra) {
+        console.error("验证需要一条 fixture / dry-run 的 runId。");
+        return 2;
+      }
+      const { journalDir, readJournal } = await import("./journal.ts");
+      const path = extra.includes("/") || extra.includes("\\")
+        ? extra
+        : `${journalDir()}/${extra.endsWith(".jsonl") ? extra : `${extra}.jsonl`}`;
+      const { events, broken } = await readJournal(path);
+      if (events.length === 0 || broken > 0) throw new Error("验证 run 不存在或记录不完整");
+      const evidence = evidenceFromJournal(events);
+      const target = (await store.list()).find((memory) => memory.id === id);
+      if (!target) throw new Error(`找不到记忆: ${id}`);
+      if (scopeKey(target.scope) !== scopeKey(evidence.scope)) throw new Error("验证 run 与候选作用域不一致");
+      if (evidence.verifyFailures.length > 0) throw new Error(`验证未通过: ${evidence.verifyFailures.join(", ")}`);
+      const checks = [...new Set(evidence.steps.flatMap((step) => step.verify))];
+      const memory = await store.markValidated(id, true, checks);
+      console.log(`已通过验证: ${memory.id}（${memory.validation.checks.join(", ")}）`);
+      return 0;
+    }
+    if (sub === "activate") {
+      const memory = await store.activate(id);
+      console.log(`已启用 ${memory.id} v${memory.version}；同作用域旧活动版本已替代。`);
+      return 0;
+    }
+    if (sub === "suspend" || sub === "reject") {
+      const memory = await store.setStatus(id, sub === "suspend" ? "suspended" : "rejected");
+      console.log(`${sub === "suspend" ? "已暂停" : "已拒绝"}: ${memory.id}`);
+      return 0;
+    }
+    if (sub === "helpful") {
+      const memory = await store.markHelpful(id);
+      console.log(`已记录有效反馈: ${memory.id}（${memory.positiveFeedback}）`);
+      return 0;
+    }
+    if (sub === "forget") {
+      const count = await store.forget(id);
+      console.log(count > 0 ? `已忘记同作用域的 ${count} 个版本及其原始纠正。` : `找不到记忆: ${id}`);
+      return count > 0 ? 0 : 2;
+    }
+    console.error(`不认识的 memory 子命令: ${rawSub}`);
+    return 2;
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : String(err));
+    return 2;
+  }
+}
+
 export async function main(argv: string[]): Promise<number> {
   const args = parseArgs(argv);
   switch (args.cmd) {
@@ -286,6 +425,10 @@ export async function main(argv: string[]): Promise<number> {
       return cmdJournal(args);
     case "profile":
       return cmdProfile(args);
+    case "feedback":
+      return cmdFeedback(args);
+    case "memory":
+      return cmdMemory(args);
     case "help":
     case "--help":
     case "-h":
@@ -299,3 +442,4 @@ export async function main(argv: string[]): Promise<number> {
 }
 
 export { LIMITS };
+
