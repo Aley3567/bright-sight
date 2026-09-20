@@ -21,6 +21,7 @@
    ├─ verify    verify.ts     返回值 + 计数 diff + 定向回读
    └─ 留痕      journal.ts    JSONL 落盘 + 本地 ULID
                 redact.ts     外部字符串 → 加盐指纹，默认开
+   └─ 纠正      evolution.ts  明确 feedback → 候选 → 验证 → 版本化启用
 ```
 
 ## 模块职责
@@ -41,6 +42,7 @@
 | `redact.ts` | 外部字符串转加盐指纹 | 默认开，未知 phase 走全量指纹化 |
 | `chrome.ts` | Chrome profile 探测 | 读盘，结果作为参数交给 `policy.ts` |
 | `settings.ts` | `~/.bright-sight/config.json` | 存目录名不存显示名 |
+| `evolution.ts` | 纠正证据、候选、版本与保留清理 | 不改 Policy/白名单；原始纠正不进入普通运行上下文 |
 | `confirm.ts` | TTY 上当场拍板 | 非 TTY 时不假装问过 |
 | `loop.ts` | 四步编排 | 全部依赖都是函数参数，可纯内存跑完整个控制流 |
 | `config.ts` | 应用白名单、搜索引擎模板、代码兜底上限 | |

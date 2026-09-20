@@ -94,6 +94,8 @@ bright-sight surface [--all] [--rebuild]
 bright-sight probe ["<一句话>"]
 bright-sight journal [<文件名或路径>]
 bright-sight profile [allow <目录名> | forget <目录名>]
+bright-sight feedback <runId> "<哪里不对>" [--skill]
+bright-sight memory [list | validate | activate | suspend | reject | helpful | forget]
 bright-sight help
 ```
 
@@ -104,6 +106,8 @@ bright-sight help
 | `probe` | 只决策不执行的连通性探针，面向全量动作面 |
 | `journal` | 不带参数列出最近 20 条历史 run；带文件名回放那一次，并提示其中有几条是未脱敏的原文 |
 | `profile` | 不带子命令时打印允许名单与当前在用的 profile；`allow` 加进名单，`forget` 移出。没有 `list` 子命令，列表就是不带子命令那条路径 |
+| `feedback` | 用户明确提交一次纠正，生成候选偏好或 2–5 步短技能；不会自动启用 |
+| `memory` | 查看、验证、启用、暂停、拒绝或忘记候选与版本 |
 
 | 环境变量 | 用途 | 默认 |
 |---|---|---|
@@ -172,6 +176,7 @@ $ bright-sight profile
 - [设计](docs/design.md)：安全边界怎么划的，四道硬闸、允许清单、verify 的判据来源
 - [架构](docs/architecture.md)：模块职责与数据流，改代码前先读
 - [贡献](CONTRIBUTING.md)：怎么跑测试、怎么加新动作
+- [自进化](docs/self-evolution.md)：纠正、候选、反馈、版本与删除边界
 
 ## 许可证
 
