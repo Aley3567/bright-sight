@@ -1,0 +1,13 @@
+node_modules/
+package-lock.json
+
+# 运行时状态：动作面缓存与运行日志。
+# journal 逐条记录用户原话、窗口标题、URL、笔记正文，是本仓最大的隐私泄露面，
+# 绝不能进版本库。改这一行前先想清楚 ~/.bright-sight/journal/ 里有什么。
+.bright-sight/
+
+# 本机配置（Chrome profile 等），内容因人而异，不是代码
+config.local.json
+
+.DS_Store
+*.log
