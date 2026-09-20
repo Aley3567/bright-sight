@@ -48,6 +48,14 @@ export type JournalEvent = {
   step: number;
   /** 四步闭环里的哪一步，或 run 级别的开始/结束。 */
   phase: "run.start" | "observe" | "judge" | "act" | "verify" | "run.end";
+  /**
+   * 这条事件的 data 是否经过脱敏。
+   *
+   * 逐条记而不是整份文件记一次：留痕是 append-only 的，同一个文件理论上可以跨越
+   * 一次配置变更。回放时如果分不清哪几行是原文，「这份记录能不能拿给别人看」
+   * 就没有答案了。
+   */
+  redacted: boolean;
   data: unknown;
 };
 
@@ -57,7 +65,21 @@ export type Journal = {
   append: (phase: JournalEvent["phase"], step: number, data: unknown) => Promise<void>;
 };
 
-export type JournalOptions = UlidOptions & { dir?: string; runId?: string };
+/** 脱敏函数：拿到 phase 与原始 data，返回真正落盘的那一份。 */
+export type JournalRedactor = (phase: JournalEvent["phase"], data: unknown) => unknown;
+
+export type JournalOptions = UlidOptions & {
+  dir?: string;
+  runId?: string;
+  /**
+   * 落盘前怎么脱敏。
+   *
+   * journal.ts 刻意不认识 redact.ts，也不读环境变量：它只负责把给它的东西原样追加。
+   * 「默认该不该脱敏」是策略，策略归调用方（CLI）决定，这样这个模块在测试里
+   * 能被完整地穷举，不必先摆平一堆环境。
+   */
+  redact?: JournalRedactor;
+};
 
 export function journalDir(base = defaultCacheDir()): string {
   return `${base}/journal`;
@@ -74,10 +96,13 @@ export async function openJournal(opts: JournalOptions = {}): Promise<Journal & 
   const runId = opts.runId ?? ulid(opts);
   const path = `${dir}/${runId}.jsonl`;
   const now = opts.now ?? Date.now;
+  const redact = opts.redact;
   let failures = 0;
 
   try {
-    await mkdir(dir, { recursive: true });
+    // 权限显式给出，不听凭 umask：留痕即便脱敏了也是一份「这台机器上发生过什么」的记录，
+    // 同机的其他用户没有理由读得到它
+    await mkdir(dir, { recursive: true, mode: 0o700 });
   } catch {
     failures++;
   }
@@ -87,9 +112,17 @@ export async function openJournal(opts: JournalOptions = {}): Promise<Journal & 
     path,
     failures: () => failures,
     append: async (phase, step, data) => {
-      const ev: JournalEvent = { id: ulid(opts), at: new Date(now()).toISOString(), runId, step, phase, data };
+      const ev: JournalEvent = {
+        id: ulid(opts),
+        at: new Date(now()).toISOString(),
+        runId,
+        step,
+        phase,
+        redacted: redact !== undefined,
+        data: redact ? redact(phase, data) : data,
+      };
       try {
-        await appendFile(path, `${JSON.stringify(ev)}\n`, "utf8");
+        await appendFile(path, `${JSON.stringify(ev)}\n`, { encoding: "utf8", mode: 0o600 });
       } catch {
         failures++;
       }

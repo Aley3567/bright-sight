@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "不看屏幕像素的 macOS 桌面智能体：感知来自无障碍树与应用脚本字典，决策只做类型化选择，动作走 argv 传参的 AppleScript",
   "type": "module",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "private": true,
   "bin": {
     "bright-sight": "./bin/bright-sight.js"
@@ -14,7 +14,8 @@
   "scripts": {
     "test": "node --test 'test/**/*.test.ts'",
     "typecheck": "tsc --noEmit",
-    "check": "npm run typecheck && npm test"
+    "check": "npm run typecheck && npm test",
+    "test:live": "BRIGHTSIGHT_LIVE=1 node --test 'test/**/*.test.ts'"
   },
   "dependencies": {
     "@typesafe-ai/sdk": "^0.6.0"

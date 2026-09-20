@@ -19,7 +19,14 @@ const USAGE = `bright-sight — 不看屏幕的 macOS 桌面智能体
   bright-sight journal [<文件>]
         不带参数列出历史 run；带文件名回放那一次的四步事件。
 
-  环境变量: TYPESAFE_API_KEY（必需）、BRIGHTSIGHT_ENGINE（搜索引擎，默认 google）`;
+  bright-sight profile [allow <目录名> | forget <目录名>]
+        看当前在用的 Chrome profile 与允许名单；allow / forget 增删名单。
+        AppleScript 里没有 profile 这个概念，能做的只有「看清楚会落在哪，陌生就问人」。
+
+  环境变量:
+    TYPESAFE_API_KEY     必需
+    BRIGHTSIGHT_ENGINE   搜索引擎，默认 google
+    BRIGHTSIGHT_JOURNAL  留痕脱敏。默认只落指纹；设为 full 才落原文（含原话、URL、标题）`;
 
 type Args = { cmd: string; pos: string[]; flags: Record<string, string | true> };
 
@@ -58,6 +65,8 @@ async function cmdRun(args: Args): Promise<number> {
   const { runProbe, verify } = await import("./verify.ts");
   const { openJournal } = await import("./journal.ts");
   const { snapshotLight } = await import("./perceive.ts");
+  const { askYesNo, isInteractive, precheckProfile } = await import("./confirm.ts");
+  const { makeRedactor, resolveRedactMode } = await import("./redact.ts");
   const { TypeSafeClient } = await import("@typesafe-ai/sdk");
 
   const utterance = args.pos.join(" ").trim();
@@ -68,14 +77,31 @@ async function cmdRun(args: Args): Promise<number> {
   const dryRun = args.flags.execute !== true;
   const engine = resolveEngine(typeof args.flags.engine === "string" ? args.flags.engine : undefined);
 
+  // profile 预检在执行之前：等到 policy 那道兜底闸才发现落在陌生 profile 上，
+  // 用户已经白等了一次模型调用。dry-run 不发 Apple Event，所以只看不问，
+  // 但仍然把探测结论打出来——这正是「加 --execute 之前需要先确认什么」的提前告知。
+  const pre = await precheckProfile({ ask: !dryRun && isInteractive() ? askYesNo : null });
+  if (pre.declined) {
+    console.log("已取消，没有发出任何 Apple Event。");
+    return 1;
+  }
+  const gate = dryRun ? ({ kind: "dry-run" } as const) : pre.gate;
+
+  const mode = resolveRedactMode();
+  const redactor = makeRedactor(mode, pre.settings.journalSalt);
+
   const offers = await loadOffers();
-  const journal = await openJournal();
+  const journal = await openJournal({
+    // full 模式不传脱敏函数，于是每条事件的 redacted 字段如实为 false
+    redact: mode === "hash" ? redactor.event : undefined,
+  });
   const client = new TypeSafeClient();
 
   console.log(`指令: 「${utterance}」`);
   console.log(`模式: ${dryRun ? "dry-run（不发送任何 Apple Event）" : "真实执行"}`);
   console.log(`选项: ${offers.offers.length} 个（动作面共 ${offers.total} 条，白名单过滤后递给模型的就这些）`);
-  console.log(`留痕: ${journal.path}\n`);
+  console.log(`Chrome: ${pre.summary}${dryRun && pre.gate.kind !== "allowed" ? "（dry-run 不受此限，但 --execute 会）" : ""}`);
+  console.log(`留痕: ${journal.path}${mode === "full" ? "（原文，未脱敏）" : "（已脱敏，只落指纹）"}\n`);
 
   const state = await runLoop(
     utterance,
@@ -93,7 +119,7 @@ async function cmdRun(args: Args): Promise<number> {
           : verify({ ...input, engine }),
       record: (phase, step, data) => journal.append(phase, step, data),
     },
-    { runId: journal.runId },
+    { runId: journal.runId, profile: gate },
   );
 
   for (const s of state.steps) {
@@ -181,7 +207,66 @@ async function cmdJournal(args: Args): Promise<number> {
     const head = `${e.at}  第 ${e.step} 步  ${e.phase}`;
     console.log(`${head}\n  ${JSON.stringify(e.data)}`);
   }
+  // 判据是「不等于 true」而不是「等于 false」：脱敏这个字段是后加的，
+  // 早于它的留痕里根本没有这一项。按 === false 判的话，那些**确实是原文**的旧记录
+  // 会被静默当成安全的——把「不知道」算成「没问题」，正是这类提示最该避免的失败。
+  const plain = events.filter((e) => e.redacted !== true).length;
   console.log(`\n${events.length} 条事件${broken > 0 ? `，另有 ${broken} 行读不出来` : ""}`);
+  if (plain > 0) {
+    console.log(`其中 ${plain} 条没有脱敏标记（含原话、URL、窗口标题），转发前先看清楚。`);
+  }
+  return 0;
+}
+
+/**
+ * profile 子命令。
+ *
+ * 只打印目录名与「是否在名单内」这类结构信息；显示名只在 `list` 里出现一次，
+ * 因为那正是人需要靠它认出「哪个是我的」的时刻。它不会被写进任何文件。
+ */
+async function cmdProfile(args: Args): Promise<number> {
+  const { detectActiveProfile } = await import("./chrome.ts");
+  const { isProfileAllowed, loadSettings, saveSettings, withProfileAllowed, withProfileForgotten, settingsPath } =
+    await import("./settings.ts");
+
+  const settings = await loadSettings();
+  const [sub, target] = args.pos;
+
+  if (sub === "allow" || sub === "forget") {
+    if (!target) {
+      console.error(`要哪个 profile？例如：bright-sight profile ${sub} Default`);
+      return 2;
+    }
+    const next = sub === "allow" ? withProfileAllowed(settings, target) : withProfileForgotten(settings, target);
+    await saveSettings(next);
+    console.log(`${sub === "allow" ? "已加入" : "已移出"}允许名单: ${target}`);
+    console.log(`名单: ${next.chrome.allowedProfiles.join(", ") || "（空）"}`);
+    console.log(settingsPath());
+    return 0;
+  }
+  if (sub) {
+    console.error(`不认识的 profile 子命令: ${sub}（可用: allow / forget）`);
+    return 2;
+  }
+
+  const d = await detectActiveProfile();
+  console.log(`设置: ${settingsPath()}`);
+  console.log(`允许名单: ${settings.chrome.allowedProfiles.join(", ") || "（空，任何 profile 都会先问一句）"}\n`);
+  if (!d.ok) {
+    console.log(`探测不到当前在用的 profile: ${d.reason}`);
+    return 0;
+  }
+  console.log(`当前在用: ${d.active.dir}${d.active.name ? `（${d.active.name}）` : ""}`);
+  console.log(`  Local State: ${d.byState ?? "无"}　Preferences mtime: ${d.byMtime ?? "无"}`);
+  if (!d.agree) {
+    // Local State 实测滞后 3–5 秒，刚切过 profile 时两路必然对不上
+    console.log(`  两路探测不一致——Local State 的写入滞后于实际切换，过几秒再看一次。`);
+  }
+  console.log(`\n全部 profile:`);
+  for (const pf of d.all) {
+    const mark = isProfileAllowed(settings, pf.dir) ? "允许" : "待确认";
+    console.log(`  [${mark}] ${pf.dir}${pf.name ? `　${pf.name}` : ""}`);
+  }
   return 0;
 }
 
@@ -199,6 +284,8 @@ export async function main(argv: string[]): Promise<number> {
     }
     case "journal":
       return cmdJournal(args);
+    case "profile":
+      return cmdProfile(args);
     case "help":
     case "--help":
     case "-h":

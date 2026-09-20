@@ -33,6 +33,15 @@ export function probeIdFor(actionId: string): string | null {
   return null;
 }
 
+/**
+ * 定向回读的执行器，可注入。
+ *
+ * 默认就是真发 Apple Event 的 `runProbe`。之所以做成参数，是为了让 verify 的判据逻辑
+ * 能被单元测试完整覆盖——在此之前，测试只能靠「故意不给 id」来绕开真实调用，
+ * 于是「回读到了但内容不对」这条最该测的路径反而测不到。
+ */
+export type ProbeRunner = (id: string, argv?: string[]) => Promise<Probe | null>;
+
 function num(v: string | undefined): number {
   const n = Number(v);
   return Number.isFinite(n) ? n : NaN;
@@ -72,11 +81,14 @@ export type VerifyInput = {
   pre: Probe | null;
   post: Probe | null;
   engine?: SearchEngine;
+  /** 定向回读怎么执行。默认真发 Apple Event。 */
+  probe?: ProbeRunner;
 };
 
 export async function verify(input: VerifyInput): Promise<VerifyResult> {
   const { actionId, exec, rawArgv, pre, post } = input;
   const engine = input.engine ?? resolveEngine();
+  const probe = input.probe ?? runProbe;
   const checks: VerifyCheck[] = [];
 
   // exit_ok 覆盖三件事：进程退出码、回读前缀、字段数——它们都在 osa.parseReadback 里判过，
@@ -100,8 +112,27 @@ export async function verify(input: VerifyInput): Promise<VerifyResult> {
     checks.push(check("tab_appeared", grew || woke,
       `标签页 ${preT} → ${postT}，窗口 ${preW} → ${postW}`));
 
+    // 按 id 把刚开的那个标签页重新找出来，而不是去看「最前面那个」。
+    // `window 1` 是叠放顺序，profile 一换就可能指向别人的窗口——这是
+    // 同名 Notes 文件夹、同名笔记之后，同一类缺陷的第三次出现。
+    const tabId = exec.readback.tab_id ?? "";
+    let got = exec.readback.url ?? "";
+    if (!tabId) {
+      checks.push(check("tab_id_readback", false, "脚本没有回读到 tab id，无法定向复查"));
+    } else {
+      const rb = await probe("probe.chrome-tab", [tabId]);
+      if (!rb) {
+        checks.push(check("tab_id_readback", false, `按 id ${tabId} 定向回读失败`));
+      } else if (rb.found !== "yes") {
+        checks.push(check("tab_id_readback", false, `按 id ${tabId} 找不到这个标签页，它可能已经被关掉了`));
+      } else {
+        checks.push(check("tab_id_readback", true, `按 id ${tabId} 找回了这个标签页`));
+        // 定向回读比脚本返回值晚发生，跳转可能在这之间才完成——以更新的那份为准
+        if (rb.url) got = rb.url;
+      }
+    }
+
     const sent = rawArgv[0] ?? "";
-    const got = exec.readback.url ?? "";
     const o = originOk(sent, got, engine);
     checks.push(check("url_origin_match", o.ok, o.detail));
   }
@@ -123,7 +154,7 @@ export async function verify(input: VerifyInput): Promise<VerifyResult> {
       checks.push(check("body_contains_payload", false, "缺少笔记 id 或待查内容，无法定向回读"));
     } else {
       // 按 id 不按 name：同名笔记的问题和同名 folder 一样真实存在
-      const rb = await runProbe("probe.notes-note", [id, needle]);
+      const rb = await probe("probe.notes-note", [id, needle]);
       if (!rb) checks.push(check("body_contains_payload", false, "定向回读失败"));
       else {
         checks.push(check("body_contains_payload", rb.contains === "yes",

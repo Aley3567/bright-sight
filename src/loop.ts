@@ -6,7 +6,7 @@ import { REGISTRY } from "./scripts.ts";
 import { extractSpans } from "./spans.ts";
 import type { OfferSet } from "./surface.ts";
 import { probeIdFor, type Probe, type VerifyInput } from "./verify.ts";
-import { isTaskAction, type Artifact, type RunState, type Snapshot, type StepRecord, type VerifyResult } from "./types.ts";
+import { isTaskAction, type Artifact, type ProfileGate, type RunState, type Snapshot, type StepRecord, type VerifyResult } from "./types.ts";
 
 /**
  * 四步闭环的编排：observe → judge → act → verify，反复直到收手。
@@ -26,7 +26,11 @@ export type LoopDeps = {
   probe: (id: string, argv?: string[]) => Promise<Probe | null>;
   checkStep: (input: VerifyInput) => Promise<VerifyResult>;
   /** 留痕，失败不影响主流程。 */
-  record?: (phase: "observe" | "judge" | "act" | "verify", step: number, data: unknown) => Promise<void>;
+  record?: (
+    phase: "run.start" | "observe" | "judge" | "act" | "verify" | "run.end",
+    step: number,
+    data: unknown,
+  ) => Promise<void>;
 };
 
 export type LoopOptions = {
@@ -34,6 +38,13 @@ export type LoopOptions = {
   runId?: string;
   /** 连续 WAIT 的容忍次数。超过说明模型在原地打转，不是真的在等。 */
   maxConsecutiveWaits?: number;
+  /**
+   * Chrome profile 闸门状态，原样透传给 policy。
+   *
+   * loop 不探测也不解释它——探测要读磁盘，而 loop 的全部依赖都是函数参数，
+   * 这是它能被纯内存测试跑完整个控制流的原因。
+   */
+  profile?: ProfileGate;
 };
 
 /** 产物值可能很长（网页标题、URL），给模型看摘要就够，完整值只在代码里流转。 */
@@ -70,11 +81,38 @@ function summarize(rec: StepRecord): string {
   return `第 ${rec.step} 步：${rec.actionId} — ${v}`;
 }
 
+/**
+ * 记一条 run.start、跑完、再记一条 run.end。
+ *
+ * 包在外面而不是散进 runSteps 的每个 return：那里有七条返回路径，
+ * 漏掉任何一条都会让留痕里出现一条永远没有结局的 run。
+ */
 export async function runLoop(
   utterance: string,
   offerSet: OfferSet,
   deps: LoopDeps,
   opts: LoopOptions = {},
+): Promise<RunState> {
+  await deps.record?.("run.start", 0, {
+    utterance,
+    maxSteps: opts.maxSteps ?? LIMITS.maxSteps,
+    offers: offerSet.offers.length,
+    profile: opts.profile?.kind ?? "absent",
+  });
+  const state = await runSteps(utterance, offerSet, deps, opts);
+  await deps.record?.("run.end", state.steps.length, {
+    status: state.status,
+    steps: state.steps.length,
+    artifacts: state.artifacts.length,
+  });
+  return state;
+}
+
+async function runSteps(
+  utterance: string,
+  offerSet: OfferSet,
+  deps: LoopDeps,
+  opts: LoopOptions,
 ): Promise<RunState> {
   const maxSteps = opts.maxSteps ?? LIMITS.maxSteps;
   const maxWaits = opts.maxConsecutiveWaits ?? 2;
@@ -115,6 +153,7 @@ export async function runLoop(
         offered: offerSet.ids,
         spec: offerSet.specs.get(j.action),
         template: REGISTRY[j.action],
+        profile: opts.profile,
       });
     }
 

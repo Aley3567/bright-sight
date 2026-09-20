@@ -7,8 +7,17 @@
  * 与之相对，"为 Chrome 写一个 search 动作"才是适配代码——那是在动作面里凭空造能力。
  */
 
+/**
+ * Chrome 的应用名，`tell application "..."` 与 profile 闸都要用它。
+ *
+ * 单独抽出来不是为了少打几个字：profile 这个概念是 Chrome 独有的，
+ * policy.ts 的 profile 闸必须判断「这条动作是不是发给 Chrome 的」。
+ * 散落的字符串字面量迟早会写岔一个，而写岔的后果是安全闸静默失效。
+ */
+export const CHROME_APP = "Google Chrome" as const;
+
 /** 执行白名单。动作面再大，能真正发出 Apple Event 的只有这两个。 */
-export const ALLOWED_APPS = ["Notes", "Google Chrome"] as const;
+export const ALLOWED_APPS = ["Notes", CHROME_APP] as const;
 export type AllowedApp = (typeof ALLOWED_APPS)[number];
 
 export function isAllowedApp(app: string): app is AllowedApp {

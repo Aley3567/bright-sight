@@ -1,6 +1,6 @@
-import { isAllowedApp } from "./config.ts";
+import { CHROME_APP, isAllowedApp } from "./config.ts";
 import type { ScriptTemplate } from "./scripts.ts";
-import { isTaskAction, type ActionSpec, type Judgement } from "./types.ts";
+import { isTaskAction, type ActionSpec, type Judgement, type ProfileGate } from "./types.ts";
 
 /**
  * 策略层：把一个带概率的判断变成"要不要真发出去"。
@@ -48,6 +48,14 @@ export type PolicyInput = {
   spec?: ActionSpec;
   /** 执行模板。没有模板就没有执行路径。 */
   template?: ScriptTemplate;
+  /**
+   * Chrome profile 闸门状态，由 chrome.ts 探测后传进来。
+   *
+   * **省略等于 undetectable，不等于放行。** 这个默认值是刻意的：调用方忘了探测，
+   * 结果应该是「停下来问人」而不是「静默发到某个不知道是谁的登录态里」。
+   * 安全边界的缺省值必须站在保守那一边。
+   */
+  profile?: ProfileGate;
 };
 
 /**
@@ -69,6 +77,27 @@ function hardBlocked(input: PolicyInput): string[] {
   // 第三道：模板自带，抓 sdef 误标——sdef 的动词名不足以判断后果，模板作者知道
   if (template?.effect === "destroy") hits.push(`模板 ${template.id} 声明了破坏性副作用`);
   return hits;
+}
+
+/**
+ * 第四道闸：Chrome 动作必须落在人确认过的 profile 上。
+ *
+ * 只对 Chrome 生效——profile 是 Chrome 独有的概念，给 Notes 套这条判据毫无意义。
+ * 返回拦截理由，或 null 表示放行。
+ *
+ * 值得记一笔的是这条闸为什么不能做成「自动切到正确的 profile」：Chrome 的脚本字典里
+ * 根本没有 profile 命令，AppleScript 侧无从选择。能做的只有先看清楚要落在哪，
+ * 陌生就停下来问。
+ */
+function profileBlock(app: string, gate: ProfileGate | undefined): string | null {
+  if (app !== CHROME_APP) return null;
+  const g = gate ?? { kind: "undetectable" as const, detail: "调用方没有提供 profile 探测结果" };
+  if (g.kind === "allowed") return null;
+  // dry-run 这一轮不会发出任何 Apple Event，也就无所谓落在谁的登录态里。
+  // 拦住它的唯一效果是让人连 argv 都看不到，而看见完整 argv 正是 dry-run 存在的理由。
+  if (g.kind === "dry-run") return null;
+  if (g.kind === "unknown") return `Chrome profile ${g.dir} 不在允许名单内，需要当场确认`;
+  return `探测不到当前 Chrome profile（${g.detail}），不能确定会落在谁的登录态里`;
 }
 
 export function policy(input: PolicyInput): PolicyResult {
@@ -107,6 +136,12 @@ export function policy(input: PolicyInput): PolicyResult {
   if (j.confidence < THRESHOLDS.execute) {
     return { kind: "ask", actionId: id, reasons: [`置信度 ${j.confidence.toFixed(2)} 低于 ${THRESHOLDS.execute}，先问清楚`] };
   }
+
+  // 第四道闸放在最后：前面几道回答「这件事该不该做」，这一道回答「在谁的登录态里做」。
+  // 顺序反过来的话，一个置信度过低的动作会先因为 profile 被问成 confirm，
+  // 人看到的提示就成了「要不要在某某 profile 下执行」，而真正的问题是模型根本没想清楚。
+  const gate = profileBlock(spec.app, input.profile);
+  if (gate) return { kind: "confirm", actionId: id, reasons: [gate] };
 
   return {
     kind: "execute",

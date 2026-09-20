@@ -1,13 +1,39 @@
 node_modules/
 package-lock.json
 
-# 运行时状态：动作面缓存与运行日志。
-# journal 逐条记录用户原话、窗口标题、URL、笔记正文，是本仓最大的隐私泄露面，
-# 绝不能进版本库。改这一行前先想清楚 ~/.bright-sight/journal/ 里有什么。
+# ── 运行时数据：本仓最大的隐私泄露面 ──
+# ~/.bright-sight/ 在家目录，本来就不在仓库里；这一行挡的是「有人把它软链或复制进来」。
+# 里面有 journal（逐条记录用户原话、窗口标题、URL、笔记正文）、config.json
+# （允许名单与留痕指纹盐）、surface.json（这台机器装了哪些应用）。
+# 改这一行之前先去看一眼那个目录里有什么。
 .bright-sight/
+*.jsonl
+surface.json
 
-# 本机配置（Chrome profile 等），内容因人而异，不是代码
+# 本机配置：内容因人而异，不是代码。
+# 任何 *.local.* 都按「只属于这台机器」处理，不进版本库。
 config.local.json
+*.local.json
+*.local.ts
+.env
+.env.*
 
+# 凭证。这个项目本身不读任何密钥文件，但误放进来的代价不对称。
+*.pem
+*.key
+*.p12
+id_rsa*
+
+# 构建与工具产物
+dist/
+build/
+coverage/
+*.tsbuildinfo
+*.scpt
+
+# 编辑器与系统
 .DS_Store
+.idea/
+.vscode/
+*.swp
 *.log

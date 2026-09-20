@@ -122,6 +122,34 @@ export type ExecResult =
   | { ok: true; readback: Record<string, string>; argv: string[]; ms: number }
   | { ok: false; errors: string[]; argv: string[]; ms: number };
 
+/**
+ * Chrome profile 闸门状态。
+ *
+ * 类型放在这里而不是 chrome.ts，是为了让 policy.ts 能引用它而不必 import 一个带文件 IO
+ * 的模块——policy.ts 是安全边界，它的「零 IO、纯函数」必须一眼可验。
+ * 探测怎么做在 chrome.ts，拿探测结果怎么判在 policy.ts，两件事不互相依赖。
+ */
+export type ProfileGate =
+  /**
+   * 放行。`via` 记的是凭什么放行：`settings` 是名单里本来就有，
+   * `prompt` 是人刚刚当场拍的板。两者都算数，但留痕里要分得清——
+   * 「是谁允许的」和「允许了没有」是两个问题。
+   */
+  | { kind: "allowed"; dir: string; via: "settings" | "prompt" }
+  /** 探测到了，但不在名单里（或两路探测对不上，结论本身不可靠）。 */
+  | { kind: "unknown"; dir: string }
+  /** 根本没探测到。不知道会落在哪，和落在陌生 profile 一样不该静默执行。 */
+  | { kind: "undetectable"; detail: string }
+  /**
+   * 这一轮压根不会发出 Apple Event（dry-run），闸门不适用。
+   *
+   * 单列一个态而不是复用 `allowed`，是为了让意图无法被误读：`allowed` 的含义是
+   * 「人确认过可以在这个 profile 下操作」，而 dry-run 是「不会有任何操作」。
+   * 两者混在一起，留痕里就再也分不清某一次放行到底凭的是什么。
+   * 它只由 CLI 在 dry-run 路径上构造。
+   */
+  | { kind: "dry-run" };
+
 /** 单条验证判据。全部由代码判定，模型不参与自证。 */
 export type VerifyCheck = { name: string; ok: boolean; detail: string };
 

@@ -13,6 +13,30 @@ import { osa } from "../src/osa.ts";
 const LIVE = process.env.BRIGHTSIGHT_LIVE === "1";
 
 /**
+ * 按 tab id 关掉一个标签页。
+ *
+ * 清理代码同样不能按 `window 1` 定位：它是叠放顺序，测试跑完时最前面的那个窗口
+ * 未必还是我们开的那个，按位置关就可能关掉用户正在用的页面。
+ * 测试代码不是不变式的例外——这里用的是和 verify 完全相同的定位方式。
+ */
+const CLOSE_BY_ID = `on run argv
+  set tid to item 1 of argv
+  tell application "Google Chrome"
+    repeat with wi from 1 to (count of windows)
+      set ids to id of every tab of window wi
+      set k to count of ids
+      repeat with i from 1 to k
+        set thisId to item i of ids
+        if thisId is tid then
+          close tab i of window wi
+          return
+        end if
+      end repeat
+    end repeat
+  end tell
+end run`;
+
+/**
  * 只存在于测试代码里的删除模板。
  *
  * 运行时注册表按设计没有任何 effect:"destroy" 的条目，所以清理必须自带一段。
@@ -66,31 +90,71 @@ test("execute.live: 真实开一个标签页并验证落点，再关掉它", { s
   const pre = await runProbe("probe.chrome-counts");
   assert.ok(pre, "取不到执行前的窗口与标签页数");
 
-  let opened = false;
+  let tabId = "";
   try {
     const out = await execute("Google Chrome.make-tab", ctx({ span: "https://example.com/" }), 1);
     assert.ok(out.result.ok, `执行失败: ${!out.result.ok ? out.result.errors.join("；") : ""}`);
-    opened = true;
+    tabId = out.result.readback.tab_id ?? "";
+    assert.notEqual(tabId, "", "没有回读到 tab id，后续全程都只能靠位置定位");
 
     const post = await runProbe("probe.chrome-counts");
     const v = await verify({ actionId: "Google Chrome.make-tab", exec: out.result, rawArgv: out.rawArgv, pre, post });
     for (const c of v.checks) assert.ok(c.ok, `检查 ${c.name} 没通过: ${c.detail}`);
 
     assert.equal(out.artifacts.find((a) => a.key === "chrome.active_url")?.value, "https://example.com/");
+    assert.equal(out.artifacts.find((a) => a.key === "chrome.tab_id")?.value, tabId);
+
+    // 定向回读必须能把它找回来，且找到的就是我们开的那个地址
+    const back = await runProbe("probe.chrome-tab", [tabId]);
+    assert.ok(back, "按 id 定向回读失败");
+    assert.equal(back.found, "yes");
+    assert.equal(back.url, "https://example.com/");
   } finally {
-    if (opened) {
-      // 只关当前这个标签页，不碰用户其它的
-      const r = await osa(
-        `on run argv
+    if (tabId) {
+      // 按 id 关，只关我们自己开的那个
+      const r = await osa(CLOSE_BY_ID, [tabId], { timeoutMs: 10_000 });
+      if (!r.ok) console.error(`清理失败，请手动关闭 example.com 标签页: ${r.errors.join("；")}`);
+    }
+  }
+});
+
+test("execute.live: 新开的标签页不在最前面的窗口时，仍然按 id 找得回来", { skip: !LIVE && "设 BRIGHTSIGHT_LIVE=1 才跑" }, async () => {
+  // 这条压住的正是 `window 1` 那个缺陷：开完标签页之后再新建一个窗口顶到最前面，
+  // 按位置定位会读到新窗口的空白页，按 id 定位才读得到我们真正开的那个。
+  let tabId = "";
+  let decoyId = "";
+  try {
+    const out = await execute("Google Chrome.make-tab", ctx({ span: "https://example.com/?live=1" }), 1);
+    assert.ok(out.result.ok, `执行失败: ${!out.result.ok ? out.result.errors.join("；") : ""}`);
+    tabId = out.result.readback.tab_id ?? "";
+    assert.notEqual(tabId, "");
+
+    // 造一个顶在最前面的窗口，它的 active tab 不是我们要的那个
+    const decoy = await osa(
+      `on run argv
   tell application "Google Chrome"
-    set t to active tab of window 1
-    set u to URL of t
-    if u contains (item 1 of argv) then close t
+    set w to make new window
+    set t to active tab of w
+    set URL of t to (item 1 of argv)
+    set tid to id of t
   end tell
+  return tid
 end run`,
-        ["example.com"],
-        { timeoutMs: 10_000 },
-      );
+      ["https://example.com/?decoy=1"],
+      { timeoutMs: 15_000 },
+    );
+    assert.ok(decoy.ok, "没能造出用来顶在前面的窗口");
+    decoyId = decoy.raw.trim();
+    assert.notEqual(decoyId, tabId);
+
+    const back = await runProbe("probe.chrome-tab", [tabId]);
+    assert.ok(back, "按 id 定向回读失败");
+    assert.equal(back.found, "yes");
+    assert.equal(back.url, "https://example.com/?live=1", "按位置定位会在这里读到另一个窗口的地址");
+  } finally {
+    for (const id of [tabId, decoyId]) {
+      if (!id) continue;
+      const r = await osa(CLOSE_BY_ID, [id], { timeoutMs: 10_000 });
       if (!r.ok) console.error(`清理失败，请手动关闭 example.com 标签页: ${r.errors.join("；")}`);
     }
   }

@@ -111,3 +111,100 @@ test("policy: 阈值之间的大小关系没有被改坏", () => {
   assert.ok(THRESHOLDS.execute > THRESHOLDS.complete, "执行门槛应当严于完整度门槛");
   assert.ok(THRESHOLDS.destructive < 0.5, "破坏性阈值必须明显偏保守，宁可多问一次");
 });
+
+// ── 第四道闸：Chrome profile ──
+// 它和前三道在同一条路径上，且位置在最末尾。只测「陌生 profile 被拦下」这条顺风路径，
+// 会让「闸装错了位置」「把 Notes 也拦了」「置信度不足却报成 profile 问题」全绿通过。
+
+const TAB = "Google Chrome.make-tab";
+const tabOk = {
+  offered: OFFERED,
+  spec: spec({ id: TAB, app: "Google Chrome", summary: "新建标签页" }),
+  template: REGISTRY[TAB],
+};
+
+test("policy: 省略 profile 等于没探测，Chrome 动作一律要确认", () => {
+  const r = policy({ judgement: judgement({ action: TAB }), ...tabOk });
+  assert.equal(r.kind, "confirm", "安全边界的缺省值必须站在保守那一边");
+  assert.equal(r.actionId, TAB);
+});
+
+test("policy: profile 在允许名单内才放行执行", () => {
+  const r = policy({
+    judgement: judgement({ action: TAB }),
+    ...tabOk,
+    profile: { kind: "allowed", dir: "Default", via: "settings" },
+  });
+  assert.equal(r.kind, "execute");
+});
+
+test("policy: 人当场拍板放行与名单里本来就有，效力相同", () => {
+  const r = policy({
+    judgement: judgement({ action: TAB }),
+    ...tabOk,
+    profile: { kind: "allowed", dir: "Profile 3", via: "prompt" },
+  });
+  assert.equal(r.kind, "execute");
+});
+
+test("policy: 陌生 profile 走确认，理由里点出是哪个目录", () => {
+  const r = policy({
+    judgement: judgement({ action: TAB }),
+    ...tabOk,
+    profile: { kind: "unknown", dir: "Profile 7" },
+  });
+  assert.equal(r.kind, "confirm");
+  assert.match(r.reasons.join(""), /Profile 7/);
+});
+
+test("policy: 探测不出 profile 时也要确认，且说清楚是探测不出来", () => {
+  const r = policy({
+    judgement: judgement({ action: TAB }),
+    ...tabOk,
+    profile: { kind: "undetectable", detail: "读不到 Local State" },
+  });
+  assert.equal(r.kind, "confirm");
+  assert.match(r.reasons.join(""), /读不到 Local State/);
+});
+
+test("policy: profile 闸不影响 Notes——profile 是 Chrome 独有的概念", () => {
+  // 连一个刻意构造的坏 gate 都不该让 Notes 停下来
+  const r = policy({ judgement: judgement(), ...ok, profile: { kind: "unknown", dir: "Profile 7" } });
+  assert.equal(r.kind, "execute");
+});
+
+test("policy: 置信度不足优先于 profile——先回答该不该做，再回答在哪做", () => {
+  const r = policy({
+    judgement: judgement({ action: TAB, confidence: THRESHOLDS.execute - 0.1 }),
+    ...tabOk,
+    profile: { kind: "unknown", dir: "Profile 7" },
+  });
+  assert.equal(r.kind, "ask", "问题是模型没想清楚，不是落在哪个 profile");
+  assert.match(r.reasons.join(""), /置信度/);
+});
+
+test("policy: 破坏性硬闸优先于 profile 闸，理由不被顶掉", () => {
+  const r = policy({
+    judgement: judgement({ action: TAB, destructive: 0.99 }),
+    ...tabOk,
+    profile: { kind: "allowed", dir: "Default", via: "settings" },
+  });
+  assert.equal(r.kind, "confirm");
+  assert.match(r.reasons.join(""), /破坏性/);
+});
+
+test("policy: dry-run 这一轮不发 Apple Event，profile 闸不适用", () => {
+  // 拦住它的唯一效果是让人连 argv 都看不到，而看见完整 argv 正是 dry-run 存在的理由
+  const r = policy({ judgement: judgement({ action: TAB }), ...tabOk, profile: { kind: "dry-run" } });
+  assert.equal(r.kind, "execute");
+});
+
+test("policy: dry-run 不是万能通行证——前三道硬闸照样拦", () => {
+  const r = policy({
+    judgement: judgement({ action: TAB, destructive: 0.99 }),
+    ...tabOk,
+    profile: { kind: "dry-run" },
+  });
+  assert.equal(r.kind, "confirm");
+  assert.match(r.reasons.join(""), /破坏性/);
+});

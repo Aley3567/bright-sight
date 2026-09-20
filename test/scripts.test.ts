@@ -88,3 +88,36 @@ test("scripts: 探针可按动作查到，未注册的动作查不到", () => {
   assert.ok(probeOf("probe.notes-count"));
   assert.equal(probeOf("probe.不存在"), undefined);
 });
+
+test("scripts: Chrome 的模板不靠 window 1 回读——那是叠放顺序，不是我们的窗口", () => {
+  // 实测：在另一个 profile 下新开的窗口排在 win2，原 profile 的窗口仍是 win1。
+  // 按位置回读会读到别人的页面，这是同名 Notes 文件夹、同名笔记之后同一类缺陷的第三次出现。
+  const tab = REGISTRY["Google Chrome.make-tab"];
+  assert.ok(!/window 1/.test(tab.src), "make-tab 仍在按窗口序号定位");
+  assert.match(tab.src, /id of t\b/, "没有在创建的那一瞬间抓住 tab id");
+  assert.ok(tab.fields.includes("tab_id"), "tab id 必须回传，否则 verify 无从定向回读");
+  assert.equal(tab.produces?.["chrome.tab_id"], "tab_id");
+});
+
+test("scripts: 定向回读探针按 tab id 查找，且查不到时如实回答", () => {
+  const p = PROBES["probe.chrome-tab"];
+  assert.ok(p, "缺少按 id 定向回读的探针");
+  assert.deepEqual([...p.argv], ["tab_id"]);
+  assert.ok(p.fields.includes("found"), "查不到必须能和查到区分开");
+  assert.equal(p.effect, "read", "探针不得有副作用");
+});
+
+test("scripts: 计数探针数的是全部窗口的标签页，不是某一个窗口的", () => {
+  // 新标签页落在哪个窗口由 Chrome 决定（profile 不同就会落在不同窗口），
+  // 只数一个窗口会让 tab_appeared 在完全正常的情况下判失败
+  const p = PROBES["probe.chrome-counts"];
+  assert.match(p.src, /repeat with wi from 1 to nw/, "没有遍历全部窗口");
+  assert.ok(!/count of tabs of window 1/.test(p.src), "仍在只数 window 1 的标签页");
+});
+
+test("scripts: 探针一律是只读的，模型永远选不到它们", () => {
+  for (const p of Object.values(PROBES)) {
+    assert.equal(p.effect, "read", `${p.id} 不是只读探针`);
+    assert.equal(templateOf(p.id), undefined, `${p.id} 出现在了模型可选的注册表里`);
+  }
+});

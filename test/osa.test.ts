@@ -82,8 +82,8 @@ test("osa: Notes body 转义顺序正确，& 不会被二次转义", () => {
   assert.equal(escapeNotesHtml("<a&b>"), "&lt;a&amp;b&gt;");
   // 实测中会被 Notes 吞掉的搜索 URL 形态
   assert.equal(
-    escapeNotesHtml("https://x.com/s?q=a&form=b"),
-    "https://x.com/s?q=a&amp;form=b",
+    escapeNotesHtml("https://example.com/s?q=a&form=b"),
+    "https://example.com/s?q=a&amp;form=b",
   );
 });
 
