@@ -1,4 +1,5 @@
 import AppKit
+import ApplicationServices
 import XCTest
 @testable import BrightSightVoice
 
@@ -19,6 +20,15 @@ import XCTest
 /// 混在一条测试里会让任何一次失败都要重新分辨是哪一层坏了。端到端另走一条路。
 final class AXPlaygroundLiveTests: XCTestCase {
   private var playground: Process?
+  private var playgroundPID: pid_t = 0
+
+  /// 观察与执行必须走**同一个** runtime 实例。
+  ///
+  /// 这一条是被真机教出来的：最初 `observe` 和 `perform` 各自 `AXRuntime(...)` 了一个新实例，
+  /// 于是每一次 perform 都返回 `rejected_stale`——frame 存在实例里，另一个实例压根不认识
+  /// 那个 frameId。这不是缺陷，是 freshness guard 在正确工作，而测试把「同一个会话」这件事
+  /// 拆成了两半。生产上本来就是一个长驻 runtime，这里照做才测的是真东西。
+  private var runtime: AXRuntime!
 
   override func setUpWithError() throws {
     try super.setUpWithError()
@@ -28,6 +38,7 @@ final class AXPlaygroundLiveTests: XCTestCase {
     guard AXIsProcessTrusted() else {
       throw XCTSkip("当前测试宿主没有 Accessibility 权限")
     }
+    runtime = makeRuntime()
     try startPlayground()
   }
 
@@ -133,20 +144,36 @@ final class AXPlaygroundLiveTests: XCTestCase {
     process.standardError = FileHandle.nullDevice
     try process.run()
     playground = process
+    playgroundPID = process.processIdentifier
 
-    // 等它把窗口建出来并成为前台。等固定时长会有两种失败：等太短则观察不到东西（像是缺陷），
-    // 等太长则每次白等。所以轮询真正的判据——前台应用是不是我们的靶场。
+    // 观察一律带上 pid，所以**不要求靶场成为前台应用**。这条是被真机教出来的：最初这里
+    // 等的是「靶场成为 frontmost」，而从终端跑 swift test 时永远等不到——抢回焦点的是终端
+    // 自己，而观察是跟着前台走的，于是量到的是终端窗口，三个动作全部 `rejected_stale`。
+    // 靶场不需要在前台，它只需要活着、窗口还在。
     let deadline = Date().addingTimeInterval(10)
     while Date() < deadline {
-      if let front = NSWorkspace.shared.frontmostApplication,
-         front.processIdentifier == process.processIdentifier {
-        // 前台身份到位之后还要给 AX 树一点时间：窗口刚建出来时子树可能还没长齐。
+      if !process.isRunning {
+        XCTFail("靶场启动后立刻退出了")
+        return
+      }
+      if windowExists() {
         try awaitSettled()
         return
       }
       Thread.sleep(forTimeInterval: 0.1)
     }
-    XCTFail("靶场启动后 10 秒内没有成为前台应用")
+    XCTFail("靶场启动后 10 秒内没有建出窗口")
+  }
+
+  /// 靶场的窗口在不在。直接问 AX，而不是问 `NSWorkspace` 的前台是谁——后者在测试宿主里
+  /// 不可靠（见上），而且「窗口存在」才是后面的观察真正依赖的前提。
+  private func windowExists() -> Bool {
+    let app = AXUIElementCreateApplication(playgroundPID)
+    var windows: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &windows) == .success,
+          let list = windows as? [AXUIElement]
+    else { return false }
+    return !list.isEmpty
   }
 
   private func awaitSettled() throws {
@@ -161,19 +188,22 @@ final class AXPlaygroundLiveTests: XCTestCase {
     AXRuntime(budget: AXTraversalBudget(maxDepth: 12, maxNodes: 2_000, maxMilliseconds: 2_000, pageSize: 200))
   }
 
+  /// 靶场不是前台应用（见 `startPlayground`），所以两条观察都走 `application` 范围并显式带上
+  /// pid。`focusedWindow` 依赖那个进程持有 key window，在测试宿主里拿不到，用它只会得到
+  /// 「目标不在这一页」这种看起来像缺陷、实际是取景取错了的失败。
   private func observeEditor() async throws -> ObservedFrame {
-    try await observe(scope: "focusedWindow")
+    try await observe(scope: "application", pid: playgroundPID)
   }
 
   private func observeApplication() async throws -> ObservedFrame {
-    try await observe(scope: "application")
+    try await observe(scope: "application", pid: playgroundPID)
   }
 
-  private func observe(scope: String) async throws -> ObservedFrame {
-    let runtime = makeRuntime()
+  private func observe(scope: String, pid: pid_t) async throws -> ObservedFrame {
     let raw = try await call { completion in
       runtime.observe(params: .object([
         "scope": .string(scope),
+        "pid": .number(Double(pid)),
         "pageSize": .number(200),
       ]), completion: completion)
     }
@@ -200,7 +230,7 @@ final class AXPlaygroundLiveTests: XCTestCase {
     if let value { params["value"] = .string(value) }
 
     let raw = try await call { completion in
-      makeRuntime().perform(params: .object(params), completion: completion)
+      runtime.perform(params: .object(params), completion: completion)
     }
     return (raw["status"]?.stringValue, raw["error"]?.stringValue)
   }

@@ -12,6 +12,10 @@ let package = Package(
       name: "BrightSightVoice",
       path: "Sources/BrightSightVoice"
     ),
+    .executableTarget(
+      name: "AXPlayground",
+      path: "Sources/AXPlayground"
+    ),
     .testTarget(
       name: "BrightSightVoiceTests",
       dependencies: ["BrightSightVoice"],
