@@ -248,7 +248,8 @@ struct AXSurfaceBuilder {
   /// 的顺序。「从上往下第 3 个」是文字，也是人指着屏幕会说的话。
   ///
   /// 位置是**按需读**的：只有文字兜不住的那几个元素才多花一次 AX 往返。放进逐节点的批量读取
-  /// 里，就是拿 500 节点的常规路径去补一条罕见路径——真机实测 GitHub 整棵树正好顶满 150ms 预算。
+  /// 里，就是拿常规路径去补一条罕见路径：真机实测（Chrome 的 GitHub 页面，焦点窗口范围、
+  /// 按生产口径每节点读 10 个属性）整棵树 528 节点 / 109ms，150ms 预算只剩 27% 余量。
   private func positionalOrdinals(
     offers: [AXActionOffer],
     contexts: [String: String],
